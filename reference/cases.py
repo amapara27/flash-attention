@@ -19,5 +19,5 @@ CASES = {
     "max_last":  (*make_case(8, 4, 6, slice(6, 8)), 3, True),
     "blend":     (*make_case(8, 4, 6, slice(3, 6), factor=1.5), 3, True),
     "large":     (*make_case(512, 64, 64), 64, False),
-    "large_ragged": (*make_case(517, 64, 48), 64, False),
+    "large_odd": (*make_case(517, 64, 48), 64, False),
 }
