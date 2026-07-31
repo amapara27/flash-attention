@@ -9,25 +9,20 @@ import math
 torch.set_default_dtype(torch.float32)
 torch.manual_seed(0)
 
-# single head 
-# different d_k and d_v vals to ensure correct tran
-# small vals to read traces
-N = 8
-d_k = 4
-d_v = 6
-B_c = 3 
-scale = d_k**-0.5
+from attention import attention
 
-# matrix initialization
-Q = torch.randn([N, d_k])
-K = torch.randn([N, d_k])
-V = torch.randn([N, d_v])
+def flash_attention(Q, K, V, B_c, trace=False):
+    trace_log = []
 
-def flash_attention(Q, K, V):
+    N, d_k = Q.shape
+    d_v = V.shape[-1]
+    scale = d_k**-0.5
+
     # online softmax vals
     m = torch.full((N, 1), float('-inf'))
-    l = torch.full((N, 1), 0)
+    ell = torch.zeros((N, 1))
 
+    # output matrix
     O_acc = torch.zeros((N, d_v))
 
     # dividing our K, V matrices
@@ -51,14 +46,22 @@ def flash_attention(Q, K, V):
         corr = torch.exp(m - m_new) # sum correction 
         P_j = torch.exp(S_j - m_new) # [N, B_c]
 
-        l = corr * l + P_j.sum(-1, keepdim=True)
+        row_sum = P_j.sum(-1, keepdim=True)
+
+        ell = corr * ell + row_sum
 
         O_acc = corr * O_acc + P_j @ V_j # correct prev O and add new
 
         m = m_new
 
-    O = O_acc / l # final normalization
-    return O
+        if trace:
+            trace_log.append({
+                "m":      m.clone(),
+                "ell":      ell.clone(),
+                "O_acc":  O_acc.clone(),
+                "corr":   corr.clone(),
+                "rowsum": row_sum.clone()
+            })
 
-# check
-print(torch.allclose(flash_attention(Q, K, V),  F.scaled_dot_product_attention(Q, K, V), atol=1e-5))
+    O = O_acc / ell # final normalization
+    return (O, trace_log) if trace else O
