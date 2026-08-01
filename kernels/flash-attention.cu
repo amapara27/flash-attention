@@ -9,6 +9,43 @@
 
 using namespace std;
 
+// flash attention kernel - one block, but laid some ground work for multiple tiles and blocks
+__global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, int d_k, int d_v) {
+    // tile sizes
+    const int B_r = N; // rows
+    const int B_c = N; // columns
+
+    // one thread per row (unnecessary for one block, but keeping for increased size)
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // each thread calculates one row of S, O
+    const int tm = 1;
+    const int tn_s = 8;
+    const int tn_o = 6;
+
+    if (tid >= N) return;
+
+    // matmul accumulators
+    float S[tm * tn_s];
+    float O_acc[tm * tn_o] = {0.0f};
+
+    // int T_r = CEIL_DIV(N, B_r);
+    // int T_ck = CEIL_DIV(N, B_c); // transpose so need N as dividend
+
+    float scale = rsqrtf((float)d_k);
+
+    // S matrix calculation - Q @ K.T
+    for (int col = 0; col < B_c; col++) {
+        float acc = 0.0f;
+        
+        for (int k = 0; k < B_c; k++) {
+            acc += Q[tid * d_k + k] * K[col * d_k + k];
+        }
+
+        S[col] = acc * scale;
+    }
+}
+
 // load reference matrices into vectors
 std::vector<float> load(const char *path, size_t n) {
     std::vector<float> v(n);
