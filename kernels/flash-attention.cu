@@ -6,24 +6,35 @@
 #include <vector>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
-#define ks_size 32
-#define vs_size 48
+#define ks_size 
+#define vs_size 18
 
 using namespace std;
 
 // flash attention kernel for a single tile, but laid some ground work for multiple tiles and blocks
 __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, int d_k, int d_v) {
     // tile sizes
-    const int B_r = N; // rows
-    const int B_c = N; // columns
+    const int B_r = N; // query rows this block owns
+    const int B_c = 3; // keys per iteration (tiling)
+
+    int T_c = CEIL_DIV(N, B_c);                                                                                                                                                                                                                             
 
     // one thread per row (unnecessary for one block, but keeping for increased size)
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     // each thread calculates one row of S, O
     const int tm = 1;
-    const int tn_s = 8;
+    const int tn_s = B_c;
     const int tn_o = 6;
+
+    // coalescing + loading K, V into smem - not used for now since division of dims is uneven
+    int iColK = threadIdx.x % d_k;
+    int iRowK = threadIdx.x / d_k;
+    int strideK = blockDim.x / d_k;
+
+    int iColV = threadIdx.x % d_v;
+    int iRowV = threadIdx.x / d_v;
+    int strideV = blockDim.x / d_k;
 
     // smem registers (only K and V for now)
     __shared__ float Ks[ks_size];
@@ -33,59 +44,78 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
     float S[tm * tn_s];
     float O_acc[tm * tn_o] = {0.0f};
 
-    // int T_r = CEIL_DIV(N, B_r);
-    // int T_ck = CEIL_DIV(N, B_c); // transpose so need N as dividend
-
     float scale = rsqrtf((float)d_k);
 
-    // load Q and K into sram - per tjh
-    for (int i = 0; i < d_k; ++i) {
-        Ks[tid * d_k + i] = K[tid * d_k + i];
-    }
+    for (int iter = 0; iter < T_c; ++iter) {
+        // load K and V into sram - per thread
+        // coalesced - each consecutive thread accesses adjacent elements per iter
+        for (int idx = tid; idx < B_c * d_k; idx += blockDim.x) {
+            int col = idx % d_k;
+            int row = idx / d_k;
 
-    for (int i = 0; i < d_v; ++i) {
-        Vs[tid * d_v + i] = V[tid * d_v + i];
-    }
+            // global row
+            int g_row = iter * B_c + row;
 
-    __syncthreads();
-
-    if (tid >= N) return;
-
-    // S matrix calculation - Q @ K.T
-    for (int col = 0; col < B_c; ++col) {
-        float acc = 0.0f;
-        
-        for (int k = 0; k < d_k; ++k) {
-            acc += Q[tid * d_k + k] * Ks[col * d_k + k];
+            // don't go beyond dims
+            if (g_row < N) {
+                Ks[row * d_k + col] = K[(iter * B_c + row) * d_k + col]; 
+            }
         }
 
-        S[col] = acc * scale;
-    }
+        for (int idx = tid; idx < B_c * d_v; idx += blockDim.x) {
+            int col = idx % d_v;
+            int row = idx / d_v;
 
-    // one thread owns a single row for this version
-    float m = -INFINITY;
-    float ell = 0;
+            int g_row = iter * B_c + row;
 
-    // online softmax (doesn't do much for a single tile, but will be beneficial for multiple)
-    for (int i = 0; i < N; ++i) {
-        float m_new = fmaxf(m, S[i]);
-        ell = expf(m - m_new) * ell + expf(S[i] - m_new);
-        m = m_new;
-    }
-
-    // compute O - only calc P per element, no need for storage
-    for (int col = 0; col < B_c; ++col) {
-        float P = expf(S[col] - m);
-
-        for (int v = 0; v < d_v; ++v) {
-            O_acc[v] += P * Vs[col * d_v + v];
+            if (g_row < N) {
+                Vs[row * d_v + col] = V[g_row * d_v + col]; 
+            }
         }
-    }
 
-    // normalization and write - per thread
-    for (int i = 0; i < d_v; ++i) {
-        O_acc[i] = O_acc[i] / ell;
-        O[tid * d_v + i] = O_acc[i];
+        __syncthreads();
+
+        // doesn't overwrite tile row 2 on last iteration, so we can't iterate over it during S calculation
+        int cols = min(B_c, N - iter * B_c);
+
+        if (tid >= N) return;
+
+        // S matrix calculation - Q @ K.T
+        for (int col = 0; col < cols; ++col) {
+            float acc = 0.0f;
+            
+            for (int k = 0; k < d_k; ++k) {
+                acc += Q[tid * d_k + k] * Ks[col * d_k + k];
+            }
+
+            S[col] = acc * scale;
+        }
+
+        // one thread owns a single row for this version
+        float m = -INFINITY;
+        float ell = 0;
+
+        // online softmax (doesn't do much for a single tile, but will be beneficial for multiple)
+        for (int i = 0; i < N; ++i) {
+            float m_new = fmaxf(m, S[i]);
+            ell = expf(m - m_new) * ell + expf(S[i] - m_new);
+            m = m_new;
+        }
+
+        // compute O - only calc P per element, no need for storage
+        for (int col = 0; col < cols; ++col) {
+            float P = expf(S[col] - m);
+
+            for (int v = 0; v < d_v; ++v) {
+                O_acc[v] += P * Vs[col * d_v + v];
+            }
+        }
+
+        // normalization and write - per thread
+        for (int i = 0; i < d_v; ++i) {
+            O_acc[i] = O_acc[i] / ell;
+            O[tid * d_v + i] = O_acc[i];
+        }
     }
 }
 
