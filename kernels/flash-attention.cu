@@ -6,7 +6,7 @@
 #include <vector>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
-#define ks_size 
+#define ks_size 12
 #define vs_size 18
 
 using namespace std;
@@ -27,7 +27,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
     const int tn_s = B_c;
     const int tn_o = 6;
 
-    // coalescing + loading K, V into smem - not used for now since division of dims is uneven
+    // coalescing + loading K, V into smem - unused for now since division of dims is uneven
     int iColK = threadIdx.x % d_k;
     int iRowK = threadIdx.x / d_k;
     int strideK = blockDim.x / d_k;
@@ -43,8 +43,12 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
     // matmul accumulators
     float S[tm * tn_s];
     float O_acc[tm * tn_o] = {0.0f};
+    float m = -INFINITY;
+    float ell = 0;
 
     float scale = rsqrtf((float)d_k);
+
+    if (tid >= N) return;
 
     for (int iter = 0; iter < T_c; ++iter) {
         // load K and V into sram - per thread
@@ -66,8 +70,10 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
             int col = idx % d_v;
             int row = idx / d_v;
 
+            // global row
             int g_row = iter * B_c + row;
 
+            // don't go beyond dims
             if (g_row < N) {
                 Vs[row * d_v + col] = V[g_row * d_v + col]; 
             }
@@ -77,8 +83,6 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
 
         // doesn't overwrite tile row 2 on last iteration, so we can't iterate over it during S calculation
         int cols = min(B_c, N - iter * B_c);
-
-        if (tid >= N) return;
 
         // S matrix calculation - Q @ K.T
         for (int col = 0; col < cols; ++col) {
@@ -91,31 +95,45 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
             S[col] = acc * scale;
         }
 
-        // one thread owns a single row for this version
-        float m = -INFINITY;
-        float ell = 0;
+        __syncthreads();
 
-        // online softmax (doesn't do much for a single tile, but will be beneficial for multiple)
-        for (int i = 0; i < N; ++i) {
-            float m_new = fmaxf(m, S[i]);
-            ell = expf(m - m_new) * ell + expf(S[i] - m_new);
-            m = m_new;
+        float m_j = -INFINITY;
+
+        // find rowmax of tile
+        for (int i = 0; i < cols; ++i) {
+            m_j = fmaxf(m_j, S[i]);
+        }
+
+        // corrections
+        float m_new = fmaxf(m, m_j);
+        float corr = expf(m - m_new);
+        ell = corr * ell;
+
+        for (int v = 0; v < d_v; ++v) {
+            // per element correction of O
+            O_acc[v] *= corr;
         }
 
         // compute O - only calc P per element, no need for storage
         for (int col = 0; col < cols; ++col) {
-            float P = expf(S[col] - m);
+            float P = expf(S[col] - m_new);
+
+            // rowsum of exponentials
+            ell += P;
 
             for (int v = 0; v < d_v; ++v) {
                 O_acc[v] += P * Vs[col * d_v + v];
             }
         }
 
-        // normalization and write - per thread
-        for (int i = 0; i < d_v; ++i) {
-            O_acc[i] = O_acc[i] / ell;
-            O[tid * d_v + i] = O_acc[i];
-        }
+        // correct max
+        m = m_new;
+    }
+        
+    // normalization and write - per thread
+    for (int i = 0; i < d_v; ++i) {
+        O_acc[i] = O_acc[i] / ell;
+        O[tid * d_v + i] = O_acc[i];
     }
 }
 
