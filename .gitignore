@@ -6,5 +6,6 @@ matrices
 *.exe
 *.exp
 *.lib
+*.ncu-rep
 
 .vscode

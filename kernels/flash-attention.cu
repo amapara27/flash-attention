@@ -192,13 +192,13 @@ void checker(vector<float> O, vector<float> O_ref, int N, int d_v) {
 
 
 int main() {
-    const int N = 512, d_k = 64, d_v = 64;
+    const int N = 4096, d_k = 64, d_v = 64;
 
     // load reference matricss
-    auto hQ = load("../matrices/large/Q.f32", N * d_k);
-    auto hK = load("../matrices/large/K.f32", N * d_k);
-    auto hV = load("../matrices/large/V.f32", N * d_v);
-    auto hRef = load("../matrices/large/O.f32", N * d_v);
+    auto hQ = load("../matrices/massive/Q.f32", N * d_k);
+    auto hK = load("../matrices/massive/K.f32", N * d_k);
+    auto hV = load("../matrices/massive/V.f32", N * d_v);
+    auto hRef = load("../matrices/massive/O.f32", N * d_v);
 
     // allocate device mem
     float *dQ, *dK, *dV, *dO;

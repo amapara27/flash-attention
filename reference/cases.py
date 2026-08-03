@@ -20,4 +20,5 @@ CASES = {
     "blend":     (*make_case(8, 4, 6, slice(3, 6), factor=1.5), 3, True),
     "large":     (*make_case(512, 64, 64), 64, False),
     "large_odd": (*make_case(517, 64, 48), 64, False),
+    "massive": (*make_case(4096, 64, 64), 64, False)
 }
