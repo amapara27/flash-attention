@@ -6,6 +6,7 @@
 #include <vector>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
+#define qs_size 32
 #define ks_size 12
 #define vs_size 18
 
@@ -27,16 +28,8 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
     const int tn_s = B_c;
     const int tn_o = 6;
 
-    // coalescing + loading K, V into smem - unused for now since division of dims is uneven
-    int iColK = threadIdx.x % d_k;
-    int iRowK = threadIdx.x / d_k;
-    int strideK = blockDim.x / d_k;
-
-    int iColV = threadIdx.x % d_v;
-    int iRowV = threadIdx.x / d_v;
-    int strideV = blockDim.x / d_k;
-
-    // smem registers (only K and V for now)
+    // smem registers
+    __shared__ float Qs[qs_size];
     __shared__ float Ks[ks_size];
     __shared__ float Vs[vs_size];
 
@@ -50,6 +43,23 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
 
     if (tid >= N) return;
 
+    // load Q into sram - each thread loads in a column
+    // tile is N for now so load full matrix
+
+    for (int idx = tid; idx < B_r * d_k; idx += blockDim.x) {
+        // multi block indexing
+        int row = idx / d_k;
+        int col = idx % d_k;
+
+        // row = curr block * block row size + row of loop
+        int g_row = blockIdx.x * B_r + row;
+
+        Qs[idx] = Q[g_row * d_k + col];
+    }
+
+    __syncthreads();
+
+
     for (int iter = 0; iter < T_c; ++iter) {
         // load K and V into sram - per thread
         // coalesced - each consecutive thread accesses adjacent elements per iter
@@ -60,9 +70,9 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
             // global row
             int g_row = iter * B_c + row;
 
-            // don't go beyond dims
+            // don't go beyond dims - not whole division
             if (g_row < N) {
-                Ks[row * d_k + col] = K[(iter * B_c + row) * d_k + col]; 
+                Ks[row * d_k + col] = K[g_row * d_k + col]; 
             }
         }
 
@@ -89,13 +99,11 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
             float acc = 0.0f;
             
             for (int k = 0; k < d_k; ++k) {
-                acc += Q[tid * d_k + k] * Ks[col * d_k + k];
+                acc += Qs[tid * d_k + k] * Ks[col * d_k + k];
             }
 
             S[col] = acc * scale;
         }
-
-        __syncthreads();
 
         float m_j = -INFINITY;
 
@@ -128,6 +136,8 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
 
         // correct max
         m = m_new;
+
+        __syncthreads();
     }
         
     // normalization and write - per thread
