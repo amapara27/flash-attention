@@ -12,19 +12,22 @@ RAW = Path("../matrices")
 def dump_all():
     OUT.mkdir(exist_ok=True)
     for name, (Q, K, V, B_c, want_trace) in CASES.items():
-        if not want_trace:
-            continue
-        O, log = flash_attention(Q, K, V, B_c, trace=True)
-        np.savez(
-            OUT / f"{name}.npz",
-            Q=Q.numpy(), K=K.numpy(), V=V.numpy(),
-            O=O.numpy(), O_ref=attention(Q, K, V).numpy(),
-            B_c=np.int32(B_c), scale=np.float32(Q.shape[1] ** -0.5),
-            **{k: torch.stack([t[k] for t in log]).numpy()
-               for k in ("m", "ell", "O_acc", "corr", "rowsum")},
-        )
+        if want_trace:
+            O, log = flash_attention(Q, K, V, B_c, trace=True)
+            np.savez(
+                OUT / f"{name}.npz",
+                Q=Q.numpy(), K=K.numpy(), V=V.numpy(),
+                O=O.numpy(), O_ref=attention(Q, K, V).numpy(),
+                B_c=np.int32(B_c), scale=np.float32(Q.shape[1] ** -0.5),
+                **{k: torch.stack([t[k] for t in log]).numpy()
+                   for k in ("m", "ell", "O_acc", "corr", "rowsum")},
+            )
+            print(f"{name}: {len(log)} iters -> {OUT / f'{name}.npz'}")
+        else:
+            O = flash_attention(Q, K, V, B_c)
+            print(f"{name}: no trace")
 
-        dump_raw(name, {"Q" : Q, "K" : K, "V" : V, "O" : O})
+        dump_raw(name, {"Q": Q, "K": K, "V": V, "O": O})
 
         print(f"{name}: {len(log)} iters -> {OUT / f'{name}.npz'}")
 

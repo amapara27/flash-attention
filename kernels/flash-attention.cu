@@ -6,18 +6,13 @@
 #include <vector>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
-#define qs_size 32
-#define ks_size 12
-#define vs_size 18
 
 using namespace std;
 
 // flash attention kernel for a single tile, but laid some ground work for multiple tiles and blocks
-__global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, int d_k, int d_v) {
-    // tile sizes
-    const int B_r = N; // query rows this block owns
-    const int B_c = 3; // keys per iteration (tiling)
-
+// B_r - query rows a single block owns, B_c keys per tile
+template <int B_r, int B_c, int D_K, int D_V>
+__global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
     int T_c = CEIL_DIV(N, B_c);                                                                                                                                                                                                                             
 
     // one thread per row (unnecessary for one block, but keeping for increased size)
@@ -26,12 +21,12 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
     // each thread calculates one row of S, O
     const int tm = 1;
     const int tn_s = B_c;
-    const int tn_o = 6;
+    const int tn_o = D_V;
 
     // smem registers
-    __shared__ float Qs[qs_size];
-    __shared__ float Ks[ks_size];
-    __shared__ float Vs[vs_size];
+    __shared__ float Qs[B_r * D_K];
+    __shared__ float Ks[B_c * D_K];
+    __shared__ float Vs[B_c * D_V];
 
     // matmul accumulators
     float S[tm * tn_s];
@@ -39,22 +34,27 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
     float m = -INFINITY;
     float ell = 0;
 
-    float scale = rsqrtf((float)d_k);
+    float scale = rsqrtf((float)D_K);
 
-    if (tid >= N) return;
+    // ensures that no extra threads are active if N / B_r isn't a whole number
+    // allows for variety of dimensions
+    bool active = tid < N;
 
     // load Q into sram - each thread loads in a column
     // tile is N for now so load full matrix
 
-    for (int idx = tid; idx < B_r * d_k; idx += blockDim.x) {
+    // loads are now indexed by block-local threads
+    for (int idx = threadIdx.x; idx < B_r * D_K; idx += blockDim.x) {
         // multi block indexing
-        int row = idx / d_k;
-        int col = idx % d_k;
+        int row = idx / D_K;
+        int col = idx % D_K;
 
         // row = curr block * block row size + row of loop
         int g_row = blockIdx.x * B_r + row;
 
-        Qs[idx] = Q[g_row * d_k + col];
+        if (g_row < N) { 
+            Qs[idx] = Q[g_row * D_K + col];
+        }
     }
 
     __syncthreads();
@@ -63,87 +63,93 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N, i
     for (int iter = 0; iter < T_c; ++iter) {
         // load K and V into sram - per thread
         // coalesced - each consecutive thread accesses adjacent elements per iter
-        for (int idx = tid; idx < B_c * d_k; idx += blockDim.x) {
-            int col = idx % d_k;
-            int row = idx / d_k;
+        for (int idx = threadIdx.x; idx < B_c * D_K; idx += blockDim.x) {
+            int col = idx % D_K;
+            int row = idx / D_K;
 
             // global row
             int g_row = iter * B_c + row;
 
             // don't go beyond dims - not whole division
             if (g_row < N) {
-                Ks[row * d_k + col] = K[g_row * d_k + col]; 
+                Ks[row * D_K + col] = K[g_row * D_K + col]; 
             }
         }
 
-        for (int idx = tid; idx < B_c * d_v; idx += blockDim.x) {
-            int col = idx % d_v;
-            int row = idx / d_v;
+        for (int idx = threadIdx.x; idx < B_c * D_V; idx += blockDim.x) {
+            int col = idx % D_V;
+            int row = idx / D_V;
 
             // global row
             int g_row = iter * B_c + row;
 
             // don't go beyond dims
             if (g_row < N) {
-                Vs[row * d_v + col] = V[g_row * d_v + col]; 
+                Vs[row * D_V + col] = V[g_row * D_V + col]; 
             }
         }
 
         __syncthreads();
 
-        // doesn't overwrite tile row 2 on last iteration, so we can't iterate over it during S calculation
-        int cols = min(B_c, N - iter * B_c);
+        // guarding from inactive threads
+        if (active) {
+            // doesn't overwrite tile row 2 on last iteration, so we can't iterate over it during S calculation
+            int cols = min(B_c, N - iter * B_c);
 
-        // S matrix calculation - Q @ K.T
-        for (int col = 0; col < cols; ++col) {
-            float acc = 0.0f;
-            
-            for (int k = 0; k < d_k; ++k) {
-                acc += Qs[tid * d_k + k] * Ks[col * d_k + k];
+            // S matrix calculation - Q @ K.T
+            for (int col = 0; col < cols; ++col) {
+                float acc = 0.0f;
+                
+                for (int k = 0; k < D_K; ++k) {
+                    // Qs indexed by local tile - mutliple blocks
+                    acc += Qs[threadIdx.x * D_K + k] * Ks[col * D_K + k];
+                }
+
+                S[col] = acc * scale;
             }
 
-            S[col] = acc * scale;
-        }
+            float m_j = -INFINITY;
 
-        float m_j = -INFINITY;
-
-        // find rowmax of tile
-        for (int i = 0; i < cols; ++i) {
-            m_j = fmaxf(m_j, S[i]);
-        }
-
-        // corrections
-        float m_new = fmaxf(m, m_j);
-        float corr = expf(m - m_new);
-        ell = corr * ell;
-
-        for (int v = 0; v < d_v; ++v) {
-            // per element correction of O
-            O_acc[v] *= corr;
-        }
-
-        // compute O - only calc P per element, no need for storage
-        for (int col = 0; col < cols; ++col) {
-            float P = expf(S[col] - m_new);
-
-            // rowsum of exponentials
-            ell += P;
-
-            for (int v = 0; v < d_v; ++v) {
-                O_acc[v] += P * Vs[col * d_v + v];
+            // find rowmax of tile
+            for (int i = 0; i < cols; ++i) {
+                m_j = fmaxf(m_j, S[i]);
             }
-        }
 
-        // correct max
-        m = m_new;
+            // corrections
+            float m_new = fmaxf(m, m_j);
+            float corr = expf(m - m_new);
+            ell = corr * ell;
+
+            for (int v = 0; v < D_V; ++v) {
+                // per element correction of O
+                O_acc[v] *= corr;
+            }
+
+            // compute O - only calc P per element, no need for storage
+            for (int col = 0; col < cols; ++col) {
+                float P = expf(S[col] - m_new);
+
+                // rowsum of exponentials
+                ell += P;
+
+                for (int v = 0; v < D_V; ++v) {
+                    O_acc[v] += P * Vs[col * D_V + v];
+                }
+            }
+
+            // correct max
+            m = m_new;
+        }
 
         __syncthreads();
     }
-        
-    // normalization and write - per thread
-    for (int i = 0; i < d_v; ++i) {
-        O_acc[i] = O_acc[i] / ell;
-        O[tid * d_v + i] = O_acc[i];
+     
+    if (active) {
+        // normalization and write - per thread
+        for (int i = 0; i < D_V; ++i) {
+            O_acc[i] = O_acc[i] / ell;
+            O[tid * D_V + i] = O_acc[i];
+        }
     }
 }
 
@@ -175,24 +181,24 @@ void checker(vector<float> O, vector<float> O_ref, int N, int d_v) {
     else
         printf("PASS\n");
 
-    for (int r = 0; r < N; r++) {
-        printf("row %d  got:", r);
-        for (int c = 0; c < d_v; c++) printf(" %8.5f", O[r * d_v + c]);
-        printf("   want:");
-        for (int c = 0; c < d_v; c++) printf(" %8.5f", O_ref[r * d_v + c]);
-        printf("\n");
-    }
+    // for (int r = 0; r < N; r++) {
+    //     printf("row %d  got:", r);
+    //     for (int c = 0; c < d_v; c++) printf(" %8.5f", O[r * d_v + c]);
+    //     printf("   want:");
+    //     for (int c = 0; c < d_v; c++) printf(" %8.5f", O_ref[r * d_v + c]);
+    //     printf("\n");
+    // }
 }
 
 
 int main() {
-    int N = 8, d_k = 4, d_v = 6;
+    const int N = 512, d_k = 64, d_v = 64;
 
     // load reference matricss
-    auto hQ = load("../matrices/baseline/Q.f32", N * d_k);
-    auto hK = load("../matrices/baseline/K.f32", N * d_k);
-    auto hV = load("../matrices/baseline/V.f32", N * d_v);
-    auto hRef = load("../matrices/baseline/O.f32", N * d_v);
+    auto hQ = load("../matrices/large/Q.f32", N * d_k);
+    auto hK = load("../matrices/large/K.f32", N * d_k);
+    auto hV = load("../matrices/large/V.f32", N * d_v);
+    auto hRef = load("../matrices/large/O.f32", N * d_v);
 
     // allocate device mem
     float *dQ, *dK, *dV, *dO;
@@ -207,7 +213,15 @@ int main() {
     cudaMemset(dO, 0, N * d_v * sizeof(float));
 
     // launch kernel - one block for this first single tile algorithm
-    flash_attention<<<1, N>>>(dQ, dK, dV, dO, N, d_k, d_v);
+    const int b_r = 64;
+    const int b_c = 32;
+
+    // amt of blocks = ceil(Q rows / Q rows per block)
+    int blocks = CEIL_DIV(N, b_r);
+
+    // launch kernel with template dims
+    flash_attention<b_r, b_c, d_k, d_v><<<blocks, b_r>>>(dQ, dK, dV, dO, N);
+
     cudaGetLastError();
     cudaDeviceSynchronize();
 
