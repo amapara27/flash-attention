@@ -11,7 +11,7 @@ torch.manual_seed(0)
 
 from attention import attention
 
-def flash_attention(Q, K, V, B_c, trace=False):
+def flash_attention(Q, K, V, B_c, causal=False, trace=False):
     trace_log = []
 
     N, d_k = Q.shape
@@ -28,10 +28,16 @@ def flash_attention(Q, K, V, B_c, trace=False):
     # dividing our K, V matrices
     T_c = math.ceil(N / B_c )
 
+    # query row indices - masking is where key col idx > query row idx
+    q_idx = torch.arange(N).unsqueeze(-1)
+
     # iterate over K, V
     for j in range(T_c):
         start = j * B_c # start of K, V tile
         end = min(start + B_c, N) # end of K, V tile - can't go past N
+
+        # key col indices
+        k_idx = torch.arange(start, end)
 
         K_j = K[start:end, ]
         V_j = V[start:end, ]
@@ -40,11 +46,15 @@ def flash_attention(Q, K, V, B_c, trace=False):
 
         S_j = Q @ K_j.T * scale # [N, B_c]
 
+        mask = k_idx > q_idx
+        S_j = S_j.masked_fill(mask, float('-inf'))
+
         m_j = S_j.amax(-1, keepdim=True) # local rowmax - [N, 1]
         m_new = torch.maximum(m, m_j) # global rowmax
 
-        corr = torch.exp(m - m_new) # sum correction 
-        P_j = torch.exp(S_j - m_new) # [N, B_c]
+        # correction adjusted for masking: -inf - -inf = nan
+        corr = torch.where(m_new == float('-inf'), 1.0, torch.exp(m - m_new))
+        P_j = torch.where(m_new == float('-inf'), 0.0, torch.exp(S_j - m_new))
 
         row_sum = P_j.sum(-1, keepdim=True)
 
