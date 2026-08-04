@@ -13,12 +13,14 @@ def make_case(N, d_k, d_v, boost_rows=None, factor=25.0, seed=0):
 
 # name -> (Q, K, V, B_c, trace?)
 CASES = {
-    "baseline":  (*make_case(8, 4, 6), 3, True),
-    "max_first": (*make_case(8, 4, 6, slice(0, 3)), 3, True),
-    "max_mid":   (*make_case(8, 4, 6, slice(3, 6)), 3, True),
-    "max_last":  (*make_case(8, 4, 6, slice(6, 8)), 3, True),
-    "blend":     (*make_case(8, 4, 6, slice(3, 6), factor=1.5), 3, True),
-    "large":     (*make_case(512, 64, 64), 64, False),
-    "large_odd": (*make_case(517, 64, 48), 64, False),
-    "massive": (*make_case(4096, 64, 64), 64, False)
+    "baseline":  (*make_case(8, 4, 6), 3, False, True),
+    "baseline_masked":  (*make_case(8, 4, 6), 3, True, True),
+    "max_first": (*make_case(8, 4, 6, slice(0, 3)), 3, False, True),
+    "max_mid":   (*make_case(8, 4, 6, slice(3, 6)), 3, False, True),
+    "max_last":  (*make_case(8, 4, 6, slice(6, 8)), 3, False, True),
+    "blend":     (*make_case(8, 4, 6, slice(3, 6), factor=1.5), 3, False, True),
+    "large":     (*make_case(512, 64, 64), 64, False, False),
+    "large_odd": (*make_case(517, 64, 48), 64, False, False),
+    "massive": (*make_case(4096, 64, 64), 64, False, False),
+    "massive_masked": (*make_case(4096, 64, 64), 64, True, False)
 }
