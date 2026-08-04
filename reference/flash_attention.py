@@ -46,9 +46,8 @@ def flash_attention(Q, K, V, B_c, causal=False, trace=False):
 
         S_j = Q @ K_j.T * scale # [N, B_c]
 
-        mask = k_idx > q_idx
-
         if causal:
+            mask = k_idx > q_idx
             S_j = S_j.masked_fill(mask, float('-inf'))
 
         m_j = S_j.amax(-1, keepdim=True) # local rowmax - [N, 1]

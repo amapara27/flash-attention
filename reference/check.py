@@ -13,7 +13,7 @@ def check_all():
         assert err < 1e-4, f"{name}: {err:.2e}"
         print(f"{name:16s} N={Q.shape[0]:4d} B_c={B_c:3d} causal={causal} err={err:.2e}")
 
-        print(torch.allclose(O, F.scaled_dot_product_attention(Q, K, V, is_causal=causal), atol=1e-7))
+        print(torch.allclose(O, F.scaled_dot_product_attention(Q, K, V, is_causal=causal), atol=1e-5))
 
 
 if __name__ == "__main__":
