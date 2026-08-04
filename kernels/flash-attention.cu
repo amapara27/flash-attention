@@ -11,12 +11,13 @@ using namespace std;
 
 // flash attention kernel for a single tile, but laid some ground work for multiple tiles and blocks
 // B_r - query rows a single block owns, B_c keys per tile
-template <int B_r, int B_c, int D_K, int D_V>
+template <int B_r, int B_c, int D_K, int D_V, bool causal>
 __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
     int T_c = CEIL_DIV(N, B_c);                                                                                                                                                                                                                             
 
     // one thread per row (unnecessary for one block, but keeping for increased size)
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_idx = tid; // query row idx is the thread id for now - using for masking
 
     // each thread calculates one row of S, O
     const int tm = 1;
@@ -28,7 +29,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
     __shared__ float Ks[B_c * D_K];
     __shared__ float Vs[B_c * D_V];
 
-    // matmul accumulators
+    // matmul accumulators - per thread
     float S[tm * tn_s];
     float O_acc[tm * tn_o] = {0.0f};
     float m = -INFINITY;
@@ -93,12 +94,13 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
         // guarding from inactive threads
         if (active) {
-            // doesn't overwrite tile row 2 on last iteration, so we can't iterate over it during S calculation
+            // tile might be too short (less cols than the others) - doesn't overwrite
             int cols = min(B_c, N - iter * B_c);
 
             // S matrix calculation - Q @ K.T
             for (int col = 0; col < cols; ++col) {
                 float acc = 0.0f;
+                int k_idx = iter * B_c + col; // key idx is the local col within the tile the block is on
                 
                 for (int k = 0; k < D_K; ++k) {
                     // Qs indexed by local tile - mutliple blocks
@@ -106,6 +108,11 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
                 }
 
                 S[col] = acc * scale;
+
+                // masking: key col > query row
+                if (causal && k_idx > q_idx) {
+                    S[col] = -INFINITY;
+                }
             }
 
             float m_j = -INFINITY;
@@ -117,23 +124,30 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
             // corrections
             float m_new = fmaxf(m, m_j);
-            float corr = expf(m - m_new);
-            ell = corr * ell;
+            // masking
+            bool masked_out = (m_new == -INFINITY);
 
-            for (int v = 0; v < D_V; ++v) {
-                // per element correction of O
-                O_acc[v] *= corr;
-            }
-
-            // compute O - only calc P per element, no need for storage
-            for (int col = 0; col < cols; ++col) {
-                float P = expf(S[col] - m_new);
-
-                // rowsum of exponentials
-                ell += P;
+            // only runs if some part of row isn't masked - doesn't need to run if row section is completely masked
+            if (!masked_out) {
+                float corr = expf(m - m_new);
+                ell = corr * ell;
 
                 for (int v = 0; v < D_V; ++v) {
-                    O_acc[v] += P * Vs[col * D_V + v];
+                    // per element correction of O
+                    O_acc[v] *= corr;
+                }
+            
+
+                // compute O - only calc P per element, no need for storage
+                for (int col = 0; col < cols; ++col) {
+                    float P = expf(S[col] - m_new);
+
+                    // rowsum of exponentials
+                    ell += P;
+
+                    for (int v = 0; v < D_V; ++v) {
+                        O_acc[v] += P * Vs[col * D_V + v];
+                    }
                 }
             }
 
@@ -195,10 +209,10 @@ int main() {
     const int N = 4096, d_k = 64, d_v = 64;
 
     // load reference matricss
-    auto hQ = load("../matrices/massive/Q.f32", N * d_k);
-    auto hK = load("../matrices/massive/K.f32", N * d_k);
-    auto hV = load("../matrices/massive/V.f32", N * d_v);
-    auto hRef = load("../matrices/massive/O.f32", N * d_v);
+    auto hQ = load("../matrices/massive_causal/Q.f32", N * d_k);
+    auto hK = load("../matrices/massive_causal/K.f32", N * d_k);
+    auto hV = load("../matrices/massive_causal/V.f32", N * d_v);
+    auto hRef = load("../matrices/massive_causal/O.f32", N * d_v);
 
     // allocate device mem
     float *dQ, *dK, *dV, *dO;
@@ -220,7 +234,7 @@ int main() {
     int blocks = CEIL_DIV(N, b_r);
 
     // launch kernel with template dims
-    flash_attention<b_r, b_c, d_k, d_v><<<blocks, b_r>>>(dQ, dK, dV, dO, N);
+    flash_attention<b_r, b_c, d_k, d_v, true><<<blocks, b_r>>>(dQ, dK, dV, dO, N);
 
     cudaGetLastError();
     cudaDeviceSynchronize();
