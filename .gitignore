@@ -7,5 +7,6 @@ matrices
 *.exp
 *.lib
 *.ncu-rep
+*.csv
 
 .vscode

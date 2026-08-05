@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cstdio>
 #include <vector>
+#include <algorithm>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
 
@@ -37,13 +38,14 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
     float scale = rsqrtf((float)D_K);
 
+    // highest query row idx within block
+    int highest_qidx = blockIdx.x * B_r + B_r - 1;
+
     // ensures that no extra threads are active if N / B_r isn't a whole number
     // allows for variety of dimensions
     bool active = tid < N;
 
     // load Q into sram - each thread loads in a column
-    // tile is N for now so load full matrix
-
     // loads are now indexed by block-local threads
     for (int idx = threadIdx.x; idx < B_r * D_K; idx += blockDim.x) {
         // multi block indexing
@@ -62,6 +64,15 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
 
     for (int iter = 0; iter < T_c; ++iter) {
+
+        // tile skipping - entire tile is masked if the highest query index is less than the lowest key index
+        int lowest_kidx = B_c * iter;
+        bool skip = causal && lowest_kidx > highest_qidx; // only skip if kernel is actually using causal masking and condition is met
+
+        // this is safe because threads won't diverge as this is a block-level check
+        if (skip) continue;
+
+
         // load K and V into sram - per thread
         // coalesced - each consecutive thread accesses adjacent elements per iter
         for (int idx = threadIdx.x; idx < B_c * D_K; idx += blockDim.x) {
@@ -100,7 +111,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             // S matrix calculation - Q @ K.T
             for (int col = 0; col < cols; ++col) {
                 float acc = 0.0f;
-                int k_idx = iter * B_c + col; // key idx is the local col within the tile the block is on
+                int k_idx = iter * B_c + col; // key idx is the global key index = tile offset + local col
                 
                 for (int k = 0; k < D_K; ++k) {
                     // Qs indexed by local tile - mutliple blocks
@@ -204,6 +215,51 @@ void checker(vector<float> O, vector<float> O_ref, int N, int d_v) {
     // }
 }
 
+// tile size autotuner
+template <int B_r, int B_c>
+void bench(float *dQ, float *dK, float *dV, float *dO, const vector<float> &hRef, int N, int reps = 5) {
+    constexpr int smem = (B_r * 64 + B_c * 64 + B_c * 64) * sizeof(float);
+
+    if constexpr (smem > 48 * 1024) {
+        printf("%3d,%3d,SKIP,,%d\n", B_r, B_c, smem);
+        return;
+    }
+
+    int blocks = CEIL_DIV(N, B_r);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // warmup
+    flash_attention<B_r, B_c, 64, 64, true><<<blocks, B_r>>>(dQ, dK, dV, dO, N);
+    cudaDeviceSynchronize();
+
+    vector<float> times;
+    for (int r = 0; r < reps; ++r) {
+        cudaEventRecord(start);
+        flash_attention<B_r, B_c, 64, 64, true><<<blocks, B_r>>>(dQ, dK, dV, dO, N);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms;
+        cudaEventElapsedTime(&ms, start, stop);
+        times.push_back(ms);
+    }
+    sort(times.begin(), times.end());
+    float median = times[reps / 2];
+
+    // correctness
+    vector<float> hO(N * 64);
+    cudaMemcpy(hO.data(), dO, N * 64 * sizeof(float), cudaMemcpyDeviceToHost);
+    float err = 0.0f;
+    for (size_t i = 0; i < hO.size(); ++i)
+        err = fmaxf(err, fabsf(hO[i] - hRef[i]));
+
+    printf("%3d,%3d,%.3f,%.2e,%d\n", B_r, B_c, median, err, smem);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
 
 int main() {
     const int N = 4096, d_k = 64, d_v = 64;
@@ -226,15 +282,26 @@ int main() {
     cudaMemcpy(dV, hV.data(), N * d_v * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(dO, 0, N * d_v * sizeof(float));
 
-    // launch kernel - one block for this first single tile algorithm
-    const int b_r = 64;
-    const int b_c = 32;
+    // launch kernel with autotuner
+    printf("B_r,B_c,ms,max_err,smem_bytes\n");
+    bench<16,  16>(dQ, dK, dV, dO, hRef, N);
+    bench<16,  32>(dQ, dK, dV, dO, hRef, N);
+    bench<16,  64>(dQ, dK, dV, dO, hRef, N);
+    bench<32,  16>(dQ, dK, dV, dO, hRef, N);
+    bench<32,  32>(dQ, dK, dV, dO, hRef, N);
+    bench<32,  64>(dQ, dK, dV, dO, hRef, N);
+    bench<64,  16>(dQ, dK, dV, dO, hRef, N);
+    bench<64,  32>(dQ, dK, dV, dO, hRef, N);
+    bench<64,  64>(dQ, dK, dV, dO, hRef, N);
+    bench<128, 16>(dQ, dK, dV, dO, hRef, N);
+    bench<128, 32>(dQ, dK, dV, dO, hRef, N);
+    // bench<128, 64>(dQ, dK, dV, dO, hRef, N);
 
     // amt of blocks = ceil(Q rows / Q rows per block)
-    int blocks = CEIL_DIV(N, b_r);
+    // int blocks = CEIL_DIV(N, b_r);
 
     // launch kernel with template dims
-    flash_attention<b_r, b_c, d_k, d_v, true><<<blocks, b_r>>>(dQ, dK, dV, dO, N);
+    // flash_attention<b_r, b_c, d_k, d_v, true><<<blocks, b_r>>>(dQ, dK, dV, dO, N);
 
     cudaGetLastError();
     cudaDeviceSynchronize();
