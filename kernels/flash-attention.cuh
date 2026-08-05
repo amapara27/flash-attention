@@ -1,10 +1,8 @@
-#include <cassert>
+#pragma once
+
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <iostream>
-#include <cstdio>
-#include <vector>
-#include <algorithm>
+#include <math_constants.h>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
 
@@ -33,7 +31,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
     // matmul accumulators - per thread
     float S[tm * tn_s];
     float O_acc[tm * tn_o] = {0.0f};
-    float m = -INFINITY;
+    float m = -CUDART_INF_F;
     float ell = 0;
 
     float scale = rsqrtf((float)D_K);
@@ -122,11 +120,11 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
                 // masking: key col > query row
                 if (causal && k_idx > q_idx) {
-                    S[col] = -INFINITY;
+                    S[col] = -CUDART_INF_F;
                 }
             }
 
-            float m_j = -INFINITY;
+            float m_j = -CUDART_INF_F;
 
             // find rowmax of tile
             for (int i = 0; i < cols; ++i) {
@@ -136,7 +134,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             // corrections
             float m_new = fmaxf(m, m_j);
             // masking
-            bool masked_out = (m_new == -INFINITY);
+            bool masked_out = (m_new == -CUDART_INF_F);
 
             // only runs if some part of row isn't masked - doesn't need to run if row section is completely masked
             if (!masked_out) {
@@ -176,144 +174,4 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             O[tid * D_V + i] = O_acc[i];
         }
     }
-}
-
-// load reference matrices into vectors
-vector<float> load(const char *path, size_t n) {
-    std::vector<float> v(n);
-    FILE* f = fopen(path, "rb");
-    fread(v.data(), sizeof(float), n, f);
-    fclose(f);
-    return v;
-}
-
-// checker
-void checker(vector<float> O, vector<float> O_ref, int N, int d_v) {
-    float max_abs = 0.0f;
-    int bad = -1;
-
-    // indexes first miscalculation
-    for (int i = 0; i < N * d_v; i++) {
-        float d = fabsf(O[i] - O_ref[i]);
-        if (d > max_abs) max_abs = d;
-        if (bad < 0 && d > 1e-5f) bad = i;
-    }
-
-    printf("max abs err %.3e\n", max_abs);
-    if (bad >= 0)
-        printf("FAIL: first at [%d, %d] got %.8f want %.8f\n",
-               bad / d_v, bad % d_v, O[bad], O_ref[bad]);
-    else
-        printf("PASS\n");
-
-    // for (int r = 0; r < N; r++) {
-    //     printf("row %d  got:", r);
-    //     for (int c = 0; c < d_v; c++) printf(" %8.5f", O[r * d_v + c]);
-    //     printf("   want:");
-    //     for (int c = 0; c < d_v; c++) printf(" %8.5f", O_ref[r * d_v + c]);
-    //     printf("\n");
-    // }
-}
-
-// tile size autotuner
-template <int B_r, int B_c>
-void bench(float *dQ, float *dK, float *dV, float *dO, const vector<float> &hRef, int N, int reps = 5) {
-    constexpr int smem = (B_r * 64 + B_c * 64 + B_c * 64) * sizeof(float);
-
-    if constexpr (smem > 48 * 1024) {
-        printf("%3d,%3d,SKIP,,%d\n", B_r, B_c, smem);
-        return;
-    }
-
-    int blocks = CEIL_DIV(N, B_r);
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    // warmup
-    flash_attention<B_r, B_c, 64, 64, true><<<blocks, B_r>>>(dQ, dK, dV, dO, N);
-    cudaDeviceSynchronize();
-
-    vector<float> times;
-    for (int r = 0; r < reps; ++r) {
-        cudaEventRecord(start);
-        flash_attention<B_r, B_c, 64, 64, true><<<blocks, B_r>>>(dQ, dK, dV, dO, N);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms;
-        cudaEventElapsedTime(&ms, start, stop);
-        times.push_back(ms);
-    }
-    sort(times.begin(), times.end());
-    float median = times[reps / 2];
-
-    // correctness
-    vector<float> hO(N * 64);
-    cudaMemcpy(hO.data(), dO, N * 64 * sizeof(float), cudaMemcpyDeviceToHost);
-    float err = 0.0f;
-    for (size_t i = 0; i < hO.size(); ++i)
-        err = fmaxf(err, fabsf(hO[i] - hRef[i]));
-
-    printf("%3d,%3d,%.3f,%.2e,%d\n", B_r, B_c, median, err, smem);
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-}
-
-int main() {
-    const int N = 4096, d_k = 64, d_v = 64;
-
-    // load reference matricss
-    auto hQ = load("../matrices/massive_causal/Q.f32", N * d_k);
-    auto hK = load("../matrices/massive_causal/K.f32", N * d_k);
-    auto hV = load("../matrices/massive_causal/V.f32", N * d_v);
-    auto hRef = load("../matrices/massive_causal/O.f32", N * d_v);
-
-    // allocate device mem
-    float *dQ, *dK, *dV, *dO;
-    cudaMalloc(&dQ, N * d_k * sizeof(float));
-    cudaMalloc(&dK, N * d_k * sizeof(float));
-    cudaMalloc(&dV, N * d_v * sizeof(float));
-    cudaMalloc(&dO, N * d_v * sizeof(float));
-
-    cudaMemcpy(dQ, hQ.data(), N * d_k * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dK, hK.data(), N * d_k * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dV, hV.data(), N * d_v * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(dO, 0, N * d_v * sizeof(float));
-
-    // launch kernel with autotuner
-    printf("B_r,B_c,ms,max_err,smem_bytes\n");
-    bench<16,  16>(dQ, dK, dV, dO, hRef, N);
-    bench<16,  32>(dQ, dK, dV, dO, hRef, N);
-    bench<16,  64>(dQ, dK, dV, dO, hRef, N);
-    bench<32,  16>(dQ, dK, dV, dO, hRef, N);
-    bench<32,  32>(dQ, dK, dV, dO, hRef, N);
-    bench<32,  64>(dQ, dK, dV, dO, hRef, N);
-    bench<64,  16>(dQ, dK, dV, dO, hRef, N);
-    bench<64,  32>(dQ, dK, dV, dO, hRef, N);
-    bench<64,  64>(dQ, dK, dV, dO, hRef, N);
-    bench<128, 16>(dQ, dK, dV, dO, hRef, N);
-    bench<128, 32>(dQ, dK, dV, dO, hRef, N);
-    // bench<128, 64>(dQ, dK, dV, dO, hRef, N);
-
-    // amt of blocks = ceil(Q rows / Q rows per block)
-    // int blocks = CEIL_DIV(N, b_r);
-
-    // launch kernel with template dims
-    // flash_attention<b_r, b_c, d_k, d_v, true><<<blocks, b_r>>>(dQ, dK, dV, dO, N);
-
-    cudaGetLastError();
-    cudaDeviceSynchronize();
-
-    // allocate + copy output matrix to host
-    std::vector<float> hO(N * d_v);
-    cudaMemcpy(hO.data(), dO, N * d_v * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // run checker
-    checker(hO, hRef, N, d_v);
-
-    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
-
-    return 0;
 }
