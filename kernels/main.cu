@@ -39,16 +39,16 @@ void checker(const std::vector<float> &O, const std::vector<float> &O_ref, size_
 
 int main() {
     // matrix dims
-    const int N = 4096, b = 1, h = 1, d_k = 64, d_v = 64;
+    const int N = 4096, b = 1, h = 4, d_k = 64, d_v = 64;
 
     const size_t qk_elems = (size_t)b * N * h * d_k;
     const size_t vo_elems = (size_t)b * N * h * d_v;
 
     // load reference matricss
-    auto hQ   = load("../matrices/massive_causal/Q.f32", qk_elems);
-    auto hK   = load("../matrices/massive_causal/K.f32", qk_elems);
-    auto hV   = load("../matrices/massive_causal/V.f32", vo_elems);
-    auto hRef = load("../matrices/massive_causal/O.f32", vo_elems);
+    auto hQ   = load("../matrices/batch_massive_causal/Q.f32", qk_elems);
+    auto hK   = load("../matrices/batch_massive_causal/K.f32", qk_elems);
+    auto hV   = load("../matrices/batch_massive_causal/V.f32", vo_elems);
+    auto hRef = load("../matrices/batch_massive_causal/O.f32", vo_elems);
 
     // allocate device mem
     float *dQ, *dK, *dV, *dO;
@@ -62,7 +62,9 @@ int main() {
     cudaMemcpy(dV, hV.data(), vo_elems * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(dO, 0, vo_elems * sizeof(float));
 
-    // launch kernel with autotuner - B_r = 64. B_c = 32 was the best result
+    // launch kernel with autotuner - B_r = 128. B_c = 16 was the best result: 2nd fastest time but doesnt put smem at capacity compared to B_c = 32
+    // those were best B_r, B_c, but smem is at the max amount 
+
     // printf("B_r,B_c,ms,max_err,smem_bytes\n");
     // tuner<h,  16,  16>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h,  16,  32>(dQ, dK, dV, dO, hRef, b, N);
@@ -75,10 +77,9 @@ int main() {
     // tuner<h,  64,  64>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h, 128,  16>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h, 128,  32>(dQ, dK, dV, dO, hRef, b, N);
-    // tuner<h, 128,  64>(dQ, dK, dV, dO, hRef, b, N);
 
-    const int b_r = 64;
-    const int b_c = 32;
+    const int b_r = 128;
+    const int b_c = 16;
 
     // x = query tiles, y = heads, z = batches
     dim3 grid(CEIL_DIV(N, b_r), h, b);

@@ -99,10 +99,8 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             // global row
             int g_row = iter * B_c + row;
 
-            // don't go beyond dims - not whole division
-            if (g_row < N) {
-                Ks[row * D_K + col] = K[g_row * stride_n_qk + col]; 
-            }
+            // padding to allow various dim sizes
+            Ks[row * D_K + col] = (g_row < N) ? K[g_row * stride_n_qk + col] : 0.0f;
         }
 
         for (int idx = threadIdx.x; idx < B_c * D_V; idx += blockDim.x) {
@@ -112,10 +110,8 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             // global row
             int g_row = iter * B_c + row;
 
-            // don't go beyond dims
-            if (g_row < N) {
-                Vs[row * D_V + col] = V[g_row * stride_n_vo + col]; 
-            }
+            // padding to allow various dim sizes
+            Vs[row * D_V + col] = (g_row < N) ? V[g_row * stride_n_vo + col] : 0.0f;
         }
 
         __syncthreads();
@@ -123,13 +119,16 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
         // guarding from inactive threads
         if (active) {
             // tile might be too short (less cols than the others) - doesn't overwrite
-            int cols = min(B_c, N - iter * B_c);
+            // int cols = min(B_c, N - iter * B_c);
+
 
             // S matrix calculation - Q @ K.T
-            for (int col = 0; col < cols; ++col) {
+            #pragma unroll
+            for (int col = 0; col < B_c; ++col) {
                 float acc = 0.0f;
                 int k_idx = iter * B_c + col; // key idx is the global key index = tile offset + local col
                 
+                #pragma unroll
                 for (int k = 0; k < D_K; ++k) {
                     // Qs indexed by local tile - mutliple blocks
                     acc += Qs[threadIdx.x * D_K + k] * Ks[col * D_K + k];
@@ -137,8 +136,9 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
                 S[col] = acc * scale;
 
-                // masking: key col > query row
-                if (causal && k_idx > q_idx) {
+                // masking: key col > query row - sets element to negative infinity
+                // handles various dim sizes for N - some tiles may only have x < B_c real columns, so only put values in those
+                if (k_idx >= N || (causal && k_idx > q_idx)) {
                     S[col] = -CUDART_INF_F;
                 }
             }
@@ -146,7 +146,9 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             float m_j = -CUDART_INF_F;
 
             // find rowmax of tile
-            for (int i = 0; i < cols; ++i) {
+            // can now use B_c since padding is implemented - extra cols won't have an impact
+            #pragma unroll
+            for (int i = 0; i < B_c; ++i) {
                 m_j = fmaxf(m_j, S[i]);
             }
 
@@ -167,7 +169,9 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             
 
                 // compute O - only calc P per element, no need for storage
-                for (int col = 0; col < cols; ++col) {
+                // can now use B_c since padding is implemented - extra cols won't have an impact
+                #pragma unroll
+                for (int col = 0; col < B_c; ++col) {
                     float P = expf(S[col] - m_new);
 
                     // rowsum of exponentials

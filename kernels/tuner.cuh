@@ -11,7 +11,7 @@
 // tile size autotuner
 template <int H, int B_r, int B_c, int D_K = 64, int D_V = 64>
 void tuner(float *dQ, float *dK, float *dV, float *dO, const std::vector<float> &hRef,
-           int B, int N, int reps = 5) {
+           int B, int N, int reps = 20) {
     constexpr int smem = (B_r * D_K + B_c * D_K + B_c * D_V) * sizeof(float);
 
     if constexpr (smem > 48 * 1024) {
