@@ -27,7 +27,7 @@ void tuner(float *dQ, float *dK, float *dV, float *dO, const std::vector<float> 
     cudaEventCreate(&stop);
 
     // warmup
-    flash_attention<H, B_r, B_c, D_K, D_V, true><<<grid, B_r>>>(dQ, dK, dV, dO, N);
+    flash_attention<H, B_r, B_c, D_K, D_V, true><<<grid, B_r * 2>>>(dQ, dK, dV, dO, N);
 
     // a launch that fails (smem over limit, bad config) is silent
     cudaError_t launch = cudaGetLastError();

@@ -64,7 +64,6 @@ int main() {
 
     // launch kernel with autotuner - B_r = 128. B_c = 16 was the best result: 2nd fastest time but doesnt put smem at capacity compared to B_c = 32
     // those were best B_r, B_c, but smem is at the max amount 
-
     // printf("B_r,B_c,ms,max_err,smem_bytes\n");
     // tuner<h,  16,  16>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h,  16,  32>(dQ, dK, dV, dO, hRef, b, N);
@@ -75,17 +74,17 @@ int main() {
     // tuner<h,  64,  16>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h,  64,  32>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h,  64,  64>(dQ, dK, dV, dO, hRef, b, N);
-    // tuner<h, 128,  16>(dQ, dK, dV, dO, hRef, b, N);
-    // tuner<h, 128,  32>(dQ, dK, dV, dO, hRef, b, N);
+    tuner<h, 128,  16>(dQ, dK, dV, dO, hRef, b, N);
+    tuner<h, 128,  32>(dQ, dK, dV, dO, hRef, b, N);
 
     const int b_r = 128;
     const int b_c = 16;
 
-    // x = query tiles, y = heads, z = batches
+    // x = query blocks, y = heads, z = batches
     dim3 grid(CEIL_DIV(N, b_r), h, b);
 
     // launch kernel with template dims
-    flash_attention<h, b_r, b_c, d_k, d_v, true><<<grid, b_r>>>(dQ, dK, dV, dO, N);
+    flash_attention<h, b_r, b_c, d_k, d_v, true><<<grid, 2 * b_r>>>(dQ, dK, dV, dO, N);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) { printf("launch failed: %s\n", cudaGetErrorString(err)); return 1; }

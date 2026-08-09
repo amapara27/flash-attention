@@ -14,9 +14,14 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
     // one thread per row (unnecessary for one block, but keeping for increased size)
     // int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // query row idx is the thread id within the block
-    int q_idx = blockIdx.x * B_r + threadIdx.x;
+
+    // warp partitioning: two threads per row
+    int row_idx = threadIdx.x / 2; 
+    int row_half = threadIdx.x % 2;
+
+    // query row idx is the row idx within the block
+    int q_idx = blockIdx.x * B_r + row_idx;
+
     // highest query row idx within block
     int highest_qidx = blockIdx.x * B_r + B_r - 1;
 
@@ -38,14 +43,14 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
     V += vo_off;
     O += vo_off;
 
-    // each thread calculates one row of S, O
+    // each thread calculates half of a row of S, O
     const int tm = 1;
     const int tn_s = B_c;
-    const int tn_o = D_V;
+    const int tn_o = D_V / 2; // each thread computes the final dp of D_V / 2 elements in O_acc
 
-    // matmul accumulators - per thread
-    float S[tm * tn_s];
-    float O_acc[tm * tn_o] = {0.0f};
+    // matmul accumulator registers - per thread
+    float S[tm * tn_s]; // warp partitioning makes each element a partial sum - needs shuffling
+    float O_acc[tm * tn_o] = {0.0f}; // each thrad 
     float m = -CUDART_INF_F;
     float ell = 0;
 
@@ -122,16 +127,17 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             // int cols = min(B_c, N - iter * B_c);
 
 
-            // S matrix calculation - Q @ K.T
+            // First matmul: S matrix calculation - Q @ K.T
+            // warp partitioning: start at the first col of the half the thread is working on, iterate for D_K / 2 (half)
             #pragma unroll
             for (int col = 0; col < B_c; ++col) {
                 float acc = 0.0f;
                 int k_idx = iter * B_c + col; // key idx is the global key index = tile offset + local col
                 
                 #pragma unroll
-                for (int k = 0; k < D_K; ++k) {
+                for (int k = row_half * (D_K / 2); k < row_half * (D_K / 2) + (D_K / 2); ++k) {
                     // Qs indexed by local tile - mutliple blocks
-                    acc += Qs[threadIdx.x * D_K + k] * Ks[col * D_K + k];
+                    acc += Qs[row_idx * D_K + k] * Ks[col * D_K + k];
                 }
 
                 S[col] = acc * scale;
@@ -143,6 +149,13 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
                 }
             }
 
+            // shuffle
+            // each entry needs its own shuffle: two partials across two lanes, B_c entries, B_c shuffles
+            #pragma unroll
+            for (int col = 0; col < B_c; ++col) {
+                S[col] += __shfl_xor_sync(__activemask(), S[col], 1);
+            }
+            
             float m_j = -CUDART_INF_F;
 
             // find rowmax of tile
@@ -161,15 +174,17 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             if (!masked_out) {
                 float corr = expf(m - m_new);
                 ell = corr * ell;
-
-                for (int v = 0; v < D_V; ++v) {
+                
+                // O_acc is only D_V / 2 wide now
+                for (int v = 0; v < D_V / 2; ++v) {
                     // per element correction of O
                     O_acc[v] *= corr;
                 }
             
 
-                // compute O - only calc P per element, no need for storage
+                // Second matmul: compute O - only calc P per element, no need for storage
                 // can now use B_c since padding is implemented - extra cols won't have an impact
+                // warp partitioning: each thread does half of its row
                 #pragma unroll
                 for (int col = 0; col < B_c; ++col) {
                     float P = expf(S[col] - m_new);
@@ -177,8 +192,9 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
                     // rowsum of exponentials
                     ell += P;
 
-                    for (int v = 0; v < D_V; ++v) {
-                        O_acc[v] += P * Vs[col * D_V + v];
+                    for (int v = 0; v < D_V / 2; ++v) {
+                        // col * D_V gets row, row_half * D_V / 2 gets starting half, v gets correct col within that half
+                        O_acc[v] += P * Vs[col * D_V + row_half * (D_V / 2) + v];
                     }
                 }
             }
@@ -192,9 +208,10 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
      
     if (active) {
         // normalization and write - per thread
-        for (int i = 0; i < D_V; ++i) {
+        for (int i = 0; i < D_V / 2; ++i) {
             O_acc[i] = O_acc[i] / ell;
-            O[q_idx * stride_n_vo + i] = O_acc[i];
+            // q_idx * stride_n_vo gets row, row_half * D_V / 2 gets starting half, i gets correct col within that half
+            O[q_idx * stride_n_vo + row_half * (D_V / 2) + i] = O_acc[i];
         }
     }
 }
