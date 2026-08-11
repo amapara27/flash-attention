@@ -3,13 +3,14 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <math_constants.h>
+#include <cuda_fp16.h>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
 
 // flash attention kernel for a single tile, but laid some ground work for multiple tiles and blocks
 // B_r - query rows a single block owns, B_c keys per tile
 template <int H, int B_r, int B_c, int D_K, int D_V, bool causal>
-__global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
+__global__ void flash_attention(__half *Q, __half* K, __half* V, float *O, int N) {
     // matrix dims: [Batches (B), Sequence Length (N), Attention Head (H), Dimensionality (D)]                                                                                                                                                                                                                          
 
     // one thread per row (unnecessary for one block, but keeping for increased size)
@@ -54,12 +55,15 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
     float m = -CUDART_INF_F;
     float ell = 0;
 
-    float scale = rsqrtf((float)D_K); // scale val for attention
+    // scale val for attention
+    // putting into log2 space to enable exp2f - better perf on GPUs
+    // expf does the conversion per call, change once here to mitigate that
+    float scale = rsqrtf((float)D_K) * log2(exp(1.0)); 
 
     // smem registers
-    __shared__ float Qs[B_r * D_K];
-    __shared__ float Ks[B_c * D_K];
-    __shared__ float Vs[B_c * D_V];
+    __shared__ __half Qs[B_r * D_K];
+    __shared__ __half Ks[B_c * D_K];
+    __shared__ __half Vs[B_c * D_V];
 
     // ensures that no extra threads are active if N / B_r isn't a whole number
     // allows for variety of dimensions
@@ -76,7 +80,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
         int g_row = blockIdx.x * B_r + row;
 
         if (g_row < N) { 
-            Qs[idx] = Q[g_row * stride_n_qk + col];
+            Qs[idx] = __float2half(Q[g_row * stride_n_qk + col]);
         }
     }
 
@@ -105,7 +109,8 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             int g_row = iter * B_c + row;
 
             // padding to allow various dim sizes
-            Ks[row * D_K + col] = (g_row < N) ? K[g_row * stride_n_qk + col] : 0.0f;
+            // convert fp32 to fp16 vals
+            Ks[row * D_K + col] = (g_row < N) ? __float2half(K[g_row * stride_n_qk + col]) : __float2half(0.0f);
         }
 
         for (int idx = threadIdx.x; idx < B_c * D_V; idx += blockDim.x) {
@@ -116,7 +121,8 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
             int g_row = iter * B_c + row;
 
             // padding to allow various dim sizes
-            Vs[row * D_V + col] = (g_row < N) ? V[g_row * stride_n_vo + col] : 0.0f;
+            // convert fp32 to fp16 vals
+            Vs[row * D_V + col] = (g_row < N) ? __float2half(V[g_row * stride_n_vo + col]) : __float2half(0.0f);
         }
 
         __syncthreads();
@@ -137,7 +143,8 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
                 #pragma unroll
                 for (int k = row_half * (D_K / 2); k < row_half * (D_K / 2) + (D_K / 2); ++k) {
                     // Qs indexed by local tile - mutliple blocks
-                    acc += Qs[row_idx * D_K + k] * Ks[col * D_K + k];
+                    // recast fp16 vals to fp32 to minimize round errors
+                    acc += __half2float(Qs[row_idx * D_K + k]) * __half2float(Ks[col * D_K + k]);
                 }
 
                 S[col] = acc * scale;
@@ -172,7 +179,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
 
             // only runs if some part of row isn't masked - doesn't need to run if row section is completely masked
             if (!masked_out) {
-                float corr = expf(m - m_new);
+                float corr = exp2f(m - m_new);
                 ell = corr * ell;
                 
                 // O_acc is only D_V / 2 wide now
@@ -187,14 +194,14 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *O, int N) {
                 // warp partitioning: each thread does half of its row
                 #pragma unroll
                 for (int col = 0; col < B_c; ++col) {
-                    float P = expf(S[col] - m_new);
+                    float P = exp2f(S[col] - m_new);
 
                     // rowsum of exponentials
                     ell += P;
 
                     for (int v = 0; v < D_V / 2; ++v) {
                         // col * D_V gets row, row_half * D_V / 2 gets starting half, v gets correct col within that half
-                        O_acc[v] += P * Vs[col * D_V + row_half * (D_V / 2) + v];
+                        O_acc[v] += P * __half2float(Vs[col * D_V + row_half * (D_V / 2) + v]);
                     }
                 }
             }
