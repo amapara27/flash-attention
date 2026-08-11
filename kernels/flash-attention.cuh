@@ -4,13 +4,14 @@
 #include <device_launch_parameters.h>
 #include <math_constants.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
 
 // flash attention kernel for a single tile, but laid some ground work for multiple tiles and blocks
 // B_r - query rows a single block owns, B_c keys per tile
-template <int H, int B_r, int B_c, int D_K, int D_V, bool causal>
-__global__ void flash_attention(__half *Q, __half* K, __half* V, float *O, int N) {
+template <int H, int B_r, int B_c, int D_K, int D_V, bool causal, typename T = float>
+__global__ void flash_attention(T *Q, T *K, T *V, float *O, int N) {
     // matrix dims: [Batches (B), Sequence Length (N), Attention Head (H), Dimensionality (D)]                                                                                                                                                                                                                          
 
     // one thread per row (unnecessary for one block, but keeping for increased size)
@@ -57,13 +58,15 @@ __global__ void flash_attention(__half *Q, __half* K, __half* V, float *O, int N
 
     // scale val for attention
     // putting into log2 space to enable exp2f - better perf on GPUs
-    // expf does the conversion per call, change once here to mitigate that
-    float scale = rsqrtf((float)D_K) * log2(exp(1.0)); 
+    // expf does the conversion per call, change once here to mitigate that 
+    float scale = rsqrtf((float)D_K) * 1.4426950408889634f; 
 
     // smem registers
     __shared__ __half Qs[B_r * D_K];
-    __shared__ __half Ks[B_c * D_K];
-    __shared__ __half Vs[B_c * D_V];
+    // two arrays for double buffering
+    // align to 16 bytes - casting later
+    __align__(16) __shared__ __half Ks[2][B_c * D_K];
+    __align__(16) __shared__ __half Vs[2][B_c * D_V];
 
     // ensures that no extra threads are active if N / B_r isn't a whole number
     // allows for variety of dimensions
@@ -76,7 +79,7 @@ __global__ void flash_attention(__half *Q, __half* K, __half* V, float *O, int N
         int row = idx / D_K;
         int col = idx % D_K;
 
-        // row = curr block * block row size + row of loop
+        // global row = curr block * block row size + row of loop
         int g_row = blockIdx.x * B_r + row;
 
         if (g_row < N) { 
@@ -84,48 +87,130 @@ __global__ void flash_attention(__half *Q, __half* K, __half* V, float *O, int N
         }
     }
 
-    __syncthreads();
+    __syncthreads();  
+
+    // prologue - async loads of the first tiles of K, V
+    // async loads require 4, 8, or 16 bytes - using 16 here
+    // iterating 8 - 8 * 2 = 16 bytes
+    for (int idx = threadIdx.x; idx < B_c * (D_K / 8); idx += blockDim.x) {
+        // % D_K / 8 gives you the chunk, * 8 is starting column
+        // D_K / 8 chunks per row, 8 elements per chunk
+        int col = idx % (D_K / 8) * 8;
+
+        // (D_K / 8 chunks per row - width)
+        int row = idx / (D_K / 8);
+
+        // global row = local row for first tile (iter = 0)
+        int g_row = row;
+
+        // padding for uneven dims and async loads
+        // stride_n_qk * g_row is only 16 byte aligned if D_K * H * 2 is a multiple of 16
+        if (g_row < N) {
+            __pipeline_memcpy_async(reinterpret_cast<float4*>(&Ks[0][row * D_K + col]),
+                reinterpret_cast<const float4*>(&K[g_row * stride_n_qk + col]), sizeof(float4));
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                Ks[0][row * D_K + col + i] = __float2half(0.0f);
+            }
+        }
+    }
+
+    // idx indexes a 16 byte (8 element chunk), D_V / 8 chunks
+    for (int idx = threadIdx.x; idx < B_c * (D_V / 8); idx += blockDim.x) {
+        // % D_V / 8 gives you the chunk, * 8 is starting column
+        // D_V / 8 chunks per row, 8 elements per chunk
+        int col = idx % (D_V / 8) * 8;
+
+        // (D_V / 8 chunks per row - width)
+        int row = idx / (D_V / 8);
+
+        // global row = local row for first tile (iter = 0)
+        int g_row = row;
+
+        // padding for uneven dims and async loads
+        // float4 - 16 bytes
+        if (g_row < N) {
+            __pipeline_memcpy_async(reinterpret_cast<float4*>(&Vs[0][row * D_V + col]),
+                reinterpret_cast<const float4*>(&V[g_row * stride_n_vo + col]), sizeof(float4));
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                Vs[0][row * D_V + col + i] = __float2half(0.0f);
+            }
+        }
+    }
+
+    __pipeline_commit();
 
     // tile amount
-    int T_c = CEIL_DIV(N, B_c);   
+    int T_c = CEIL_DIV(N, B_c); 
 
     for (int iter = 0; iter < T_c; ++iter) {
+        // load K and V into sram - per thread
+        // coalesced - each consecutive thread accesses adjacent elements per iter
+        // double buffering - must ensure next batch is within tile amount
+        if (iter + 1 < T_c) {
+            for (int idx = threadIdx.x; idx < B_c * (D_K / 8); idx += blockDim.x) {
+                int col = idx % (D_K / 8) * 8;
+                int row = idx / (D_K / 8);
+
+                // global row
+                int g_row = (iter + 1) * B_c + row;
+
+                // padding to allow various dim sizes
+                // double buffering - 16 bytes, cast to float4
+                if (g_row < N) {
+                    __pipeline_memcpy_async(reinterpret_cast<float4*>(&Ks[(iter + 1) % 2][row * D_K + col]),
+                        reinterpret_cast<const float4*>(&K[g_row * stride_n_qk + col]), sizeof(float4));
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        Ks[(iter + 1) % 2][row * D_K + col + i] = __float2half(0.0f);
+                    }   
+                }
+            }
+
+            for (int idx = threadIdx.x; idx < B_c * (D_V / 8); idx += blockDim.x) {
+                int col = idx % (D_V / 8) * 8;
+                int row = idx / (D_V / 8);
+
+                // global row
+                int g_row = (iter + 1) * B_c + row;
+
+                // padding to allow various dim sizes
+                // convert fp32 to fp16 vals
+                if (g_row < N) {
+                    __pipeline_memcpy_async(reinterpret_cast<float4*>(&Vs[(iter + 1) % 2][row * D_V + col]),
+                        reinterpret_cast<const float4*>(&V[g_row * stride_n_vo + col]), sizeof(float4));
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        Vs[(iter + 1) % 2][row * D_V + col + i] = __float2half(0.0f);
+                    }
+                }
+            }
+
+            __pipeline_commit();
+
+            // two commits - only want the oldest one
+            __pipeline_wait_prior(1);
+        }
+
+        else {
+            // no prefetch - only 1 commit left
+            __pipeline_wait_prior(0);
+        }
+
+        __syncthreads();
 
         // tile skipping - entire tile is masked if the highest query index is less than the lowest key index
         int lowest_kidx = B_c * iter;
         bool skip = causal && lowest_kidx > highest_qidx; // only skip if kernel is actually using causal masking and condition is met
 
         // this is safe because threads won't diverge as this is a block-level check
+        // need to check skip condition before prefetched loads (will optimize soon) - no point in loading if vals get skipped
         if (skip) continue;
-
-
-        // load K and V into sram - per thread
-        // coalesced - each consecutive thread accesses adjacent elements per iter
-        for (int idx = threadIdx.x; idx < B_c * D_K; idx += blockDim.x) {
-            int col = idx % D_K;
-            int row = idx / D_K;
-
-            // global row
-            int g_row = iter * B_c + row;
-
-            // padding to allow various dim sizes
-            // convert fp32 to fp16 vals
-            Ks[row * D_K + col] = (g_row < N) ? __float2half(K[g_row * stride_n_qk + col]) : __float2half(0.0f);
-        }
-
-        for (int idx = threadIdx.x; idx < B_c * D_V; idx += blockDim.x) {
-            int col = idx % D_V;
-            int row = idx / D_V;
-
-            // global row
-            int g_row = iter * B_c + row;
-
-            // padding to allow various dim sizes
-            // convert fp32 to fp16 vals
-            Vs[row * D_V + col] = (g_row < N) ? __float2half(V[g_row * stride_n_vo + col]) : __float2half(0.0f);
-        }
-
-        __syncthreads();
 
         // guarding from inactive threads
         if (active) {
@@ -144,7 +229,8 @@ __global__ void flash_attention(__half *Q, __half* K, __half* V, float *O, int N
                 for (int k = row_half * (D_K / 2); k < row_half * (D_K / 2) + (D_K / 2); ++k) {
                     // Qs indexed by local tile - mutliple blocks
                     // recast fp16 vals to fp32 to minimize round errors
-                    acc += __half2float(Qs[row_idx * D_K + k]) * __half2float(Ks[col * D_K + k]);
+                    // double buffering: needs iter % 2 index
+                    acc += __half2float(Qs[row_idx * D_K + k]) * __half2float(Ks[iter % 2][col * D_K + k]);
                 }
 
                 S[col] = acc * scale;
@@ -201,7 +287,8 @@ __global__ void flash_attention(__half *Q, __half* K, __half* V, float *O, int N
 
                     for (int v = 0; v < D_V / 2; ++v) {
                         // col * D_V gets row, row_half * D_V / 2 gets starting half, v gets correct col within that half
-                        O_acc[v] += P * __half2float(Vs[col * D_V + row_half * (D_V / 2) + v]);
+                        // double buffering: needs iter % 2 index
+                        O_acc[v] += P * __half2float(Vs[iter % 2][col * D_V + row_half * (D_V / 2) + v]);
                     }
                 }
             }
