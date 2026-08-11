@@ -59,10 +59,12 @@ CASES = {
     # ---- fp16 storage precision: same shapes as the two perf cases above ----
     "fp16_massive_causal":       (*to_fp16_storage(*make_case(4096, 64, 64)), 64, False, True),
     "fp16_batch_massive_causal": (*to_fp16_storage(*make_batched_case(1, 4, 4096, 64, 64)), 64, False, True),
+    "fp16_batch_odd": (*to_fp16_storage(*make_batched_case(2, 3, 517, 64, 48, slice(3, 6))), 64, False, False)
 }
 
 # fp32 references for fp16 vals
 FP32_REF = {
     "fp16_massive_causal":       make_case(4096, 64, 64),
     "fp16_batch_massive_causal": make_batched_case(1, 4, 4096, 64, 64),
+    "fp16_batch_odd": make_batched_case(2, 3, 517, 64, 48, slice(3, 6)),
 }
