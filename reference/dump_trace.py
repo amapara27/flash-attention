@@ -6,14 +6,19 @@ import torch
 
 from attention import attention
 from flash_attention import flash_attention
-from cases import CASES
+from cases import CASES, FP32_REF
 
 OUT = Path("traces")
 RAW = Path("../matrices")
 
 
 def dump_all():
-    # deletes files before creating new ones
+    # Ghost .f32 files from renamed or removed cases silently pass/fail against
+    # stale data. Adding batch dims changes every raw file's shape, so this is
+    # exactly the moment that bites. Nuke and rebuild.
+    #
+    # NOTE: this deletes all of RAW. If anything else lives in ../matrices,
+    # move it or narrow this to the case dirs.
     shutil.rmtree(RAW, ignore_errors=True)
     shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(exist_ok=True)
@@ -36,11 +41,19 @@ def dump_all():
             O = flash_attention(Q, K, V, B_c, causal=causal)
             print(f"{name}: no trace  {tuple(Q.shape)}")
 
-        dump_raw(name, {"Q": Q, "K": K, "V": V, "O": O}, B_c, causal)
+        # calculate fp32 O matrix from true fp32 references - determine what fp16 calculations cost in kernel
+        if name.startswith("fp16_"):
+            Q_true, K_true, V_true = FP32_REF[name]
+            O_disk = attention(Q_true, K_true, V_true, causal=causal)
+        else:
+            O_disk = O
+
+        dump_raw(name, {"Q": Q, "K": K, "V": V, "O": O_disk}, B_c, causal)
 
 
-# permutes [B, H, N, d] -> [B, N, H, d] - head has to be batch dim for matmul braodcast, must swap here
 def to_disk_layout(arr):
+    # [B, H, N, d] -> [B, N, H, d]. 2D passes through.
+    # converts to correct format - head must have been batch dim for reference calcs
     return arr.permute(0, 2, 1, 3) if arr.ndim == 4 else arr
 
 
