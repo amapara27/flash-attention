@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 from attention import attention
 from flash_attention import flash_attention
-from cases import CASES
+from cases import CASES, FP32_REF
 
 
 def sdpa_ref(Q, K, V, causal):
@@ -12,8 +12,7 @@ def sdpa_ref(Q, K, V, causal):
     O = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
     return O.reshape(Q.shape[:-1] + (V.shape[-1],))
 
-
-# max error per (b, h) slize
+    # max abs error for each (b, h) slice
 def per_slice_err(O, O_ref):
     err = (O - O_ref).abs()
     return err.reshape(-1, *err.shape[-2:]).amax(dim=(-2, -1))
@@ -22,13 +21,21 @@ def per_slice_err(O, O_ref):
 def check_all():
     for name, (Q, K, V, B_c, want_trace, causal) in CASES.items():
         O = flash_attention(Q, K, V, B_c, causal=causal)
-        O_ref = attention(Q, K, V, causal=causal)
+
+        if name.startswith("fp16_"):
+            # true reference must come from fp32 first - load those in
+            Q_true, K_true, V_true = FP32_REF[name]
+            O_ref = attention(Q_true, K_true, V_true, causal=causal)
+            tol = 3e-3   # storage-rounding cost, measured ~1e-3 on these shapes
+        else:
+            O_ref = attention(Q, K, V, causal=causal)
+            tol = 1e-4
 
         err = (O - O_ref).abs().max().item()
-        assert err < 1e-4, f"{name}: vs attention {err:.2e}"
+        assert err < tol, f"{name}: vs attention {err:.2e}"
 
         sdpa_err = (O - sdpa_ref(Q, K, V, causal)).abs().max().item()
-        assert sdpa_err < 1e-4, f"{name}: vs sdpa {sdpa_err:.2e}"
+        assert sdpa_err < tol, f"{name}: vs sdpa {sdpa_err:.2e}"
 
         tag = f"{name:22s} {str(tuple(Q.shape)):22s} B_c={B_c:3d} causal={int(causal)}"
 
@@ -36,6 +43,9 @@ def check_all():
             print(f"{tag} err={err:.2e}")
             continue
 
+        # 2D uses mm, >=3D uses bmm -- different accumulation order, so this
+        # is a tight-tolerance check (~1e-7), not bit-exact. 
+        # The CUDA kernel's own (0,0) comparison against Phase 1 output has no such excuse -- keep that one strict.
         O_00 = flash_attention(Q[0, 0], K[0, 0], V[0, 0], B_c, causal=causal)
         slice_drift = (O_00 - O[0, 0]).abs().max().item()
         assert slice_drift < 1e-5, \
@@ -47,9 +57,9 @@ def check_all():
         print(f"{tag} err={err:.2e} sdpa={sdpa_err:.2e} "
               f"worst=(b{worst // H},h{worst % H}) drift={slice_drift:.1e} "
               f"spread=[{per.min():.2e}, {per.max():.2e}]")
+        
 
-
-# makes sure first slice is accurate - baseline for following comparisons
+# batched case generator's slice (0,0) must exactly match make_case other checks rely on (0,0) as a known fixed point
 def check_slice_00_matches_unbatched():
     from cases import make_case, make_batched_case
 
@@ -61,7 +71,7 @@ def check_slice_00_matches_unbatched():
     print("slice (0,0) construction matches make_case bit-exactly")
 
 
-# ensures all (b, h) slices hold distinct data
+# every (b, h) slice must hold distinct data
 def check_heads_differ():
     from cases import make_batched_case
 

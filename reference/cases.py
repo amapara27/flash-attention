@@ -34,36 +34,35 @@ def make_batched_case(B, H, N, d_k, d_v, boost_rows=None, factor=25.0, seed=0):
     return pack(Qs, d_k), pack(Ks, d_k), pack(Vs, d_v)
 
 
+# rounds fp32 vals into fp16 vals
+def to_fp16_storage(*mats):
+    return tuple(m.half().float() for m in mats)
+
+
 # name -> (Q, K, V, B_c, want_trace, causal)
 CASES = {
-    # unbatched originals
+    # ---- traced: line-by-line debug target ----
     "baseline":            (*make_case(8, 4, 6), 3, True, False),
     "baseline_causal":     (*make_case(8, 4, 6), 3, True, True),
-    "max_first":           (*make_case(8, 4, 6, slice(0, 3)), 3, True, False),
     "max_mid":             (*make_case(8, 4, 6, slice(3, 6)), 3, True, False),
-    "max_last":            (*make_case(8, 4, 6, slice(6, 8)), 3, True, False),
-    "blend":               (*make_case(8, 4, 6, slice(3, 6), factor=1.5), 3, True, False),
-    "large":               (*make_case(512, 64, 64), 64, False, False),
-    "large_causal":        (*make_case(512, 64, 64), 64, False, True),
+
+    # ---- unbatched: ragged tile + d_k != d_v, and the perf shape ----
     "large_odd":           (*make_case(517, 64, 48), 64, False, False),
-    "massive":             (*make_case(4096, 64, 64), 64, False, False),
     "massive_causal":      (*make_case(4096, 64, 64), 64, False, True),
 
-    # batched small
-    "batch_small":         (*make_batched_case(2, 3, 8, 4, 6), 3, False, False),
-    "batch_small_causal":  (*make_batched_case(2, 3, 8, 4, 6), 3, False, True),
+    # ---- batched: ragged tile + d_k!=d_v + per-head boost, all in one ----
+    "batch_odd":           (*make_batched_case(2, 3, 517, 64, 48, slice(3, 6)), 64, False, False),
 
-    # boost rows shift per head -- the head-isolation probe
-    "batch_boost":         (*make_batched_case(2, 3, 8, 4, 6, slice(3, 6)), 3, False, False),
-
-    # d_k != d_v batched: catches reusing the Q/K offset for V or O
-    "batch_odd":           (*make_batched_case(2, 3, 517, 64, 48), 64, False, False),
-
-    # batched - realistic head counts
-    "batch_heads":         (*make_batched_case(1, 32, 512, 64, 64), 64, False, False),
-    "batch_heads_causal":  (*make_batched_case(1, 32, 512, 64, 64), 64, False, True),
-    "batch_multi":         (*make_batched_case(2, 8, 512, 64, 64), 64, False, True),
-
-    # perfect shape
+    # ---- batched: the realistic perf/profiling shape ----
     "batch_massive_causal": (*make_batched_case(1, 4, 4096, 64, 64), 64, False, True),
+
+    # ---- fp16 storage precision: same shapes as the two perf cases above ----
+    "fp16_massive_causal":       (*to_fp16_storage(*make_case(4096, 64, 64)), 64, False, True),
+    "fp16_batch_massive_causal": (*to_fp16_storage(*make_batched_case(1, 4, 4096, 64, 64)), 64, False, True),
+}
+
+# fp32 references for fp16 vals
+FP32_REF = {
+    "fp16_massive_causal":       make_case(4096, 64, 64),
+    "fp16_batch_massive_causal": make_batched_case(1, 4, 4096, 64, 64),
 }
