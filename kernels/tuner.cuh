@@ -12,7 +12,7 @@
 // tile size autotuner
 // defaults to float unless half passed in
 template <int H, int B_r, int B_c, int D_K = 64, int D_V = 64, bool causal, typename T = float>
-void tuner(T *dQ, T *dK, T *dV, float *dO, const std::vector<float> &hRef, int B, int N, int reps = 20) {
+void tuner(T *dQ, T *dK, T *dV, float *dO, const std::vector<float> &hRef, int B, int N, float tol = 3e-3f, int reps = 20) {
     constexpr int smem = (B_r * D_K + 2 * B_c * D_K + 2 * B_c * D_V) * sizeof(T);
 
     if constexpr (smem > 48 * 1024) {
@@ -58,8 +58,18 @@ void tuner(T *dQ, T *dK, T *dV, float *dO, const std::vector<float> &hRef, int B
     cudaMemcpy(hO.data(), dO, hO.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
     float err = 0.0f;
-    for (size_t i = 0; i < hO.size(); ++i)
+
+    for (size_t i = 0; i < hO.size(); ++i){
         err = fmaxf(err, fabsf(hO[i] - hRef[i]));
+    }
+
+    
+    if (err > tol) {
+        printf("%3d,%3d,FAIL,%.2e,%d\n", B_r, B_c, err, smem);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        return;
+    }
 
     printf("%3d,%3d,%.3f,%.2e,%d\n", B_r, B_c, median, err, smem);
 

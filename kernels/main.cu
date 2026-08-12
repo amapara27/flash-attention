@@ -64,7 +64,7 @@ int main() {
 
     const bool causal_masking = true;
 
-    // load reference matricss
+    // load reference matrices
     auto hQ   = load_fp16("../matrices/batch_massive_causal/Q.f32", qk_elems);
     auto hK   = load_fp16("../matrices/batch_massive_causal/K.f32", qk_elems);
     auto hV   = load_fp16("../matrices/batch_massive_causal/V.f32", vo_elems);
@@ -107,11 +107,11 @@ int main() {
     // tuner<h,  64,  16>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h,  64,  32>(dQ, dK, dV, dO, hRef, b, N);
     // tuner<h,  64,  64>(dQ, dK, dV, dO, hRef, b, N);
-    tuner<h, 128, 16, d_k, d_v, causal_masking>(dQ, dK, dV, dO, hRef, b, N);
-    tuner<h, 128, 32, d_k, d_v, causal_masking>(dQ, dK, dV, dO, hRef, b, N);
+    // tuner<h, 128, 16, d_k, d_v, causal_masking>(dQ, dK, dV, dO, hRef, b, N);
+    // tuner<h, 128, 32, d_k, d_v, causal_masking>(dQ, dK, dV, dO, hRef, b, N);
 
     const int b_r = 128;
-    const int b_c = 32;
+    const int b_c = 64;
 
     // x = query blocks, y = heads, z = batches
     dim3 grid(CEIL_DIV(N, b_r), h, b);
