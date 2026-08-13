@@ -7,6 +7,7 @@
 
 #include "tuner.cuh"
 #include "flash-attention.cuh"
+#include "flash-attention-wmma.cuh"
 
 // load reference matrices into vectors
 std::vector<float> load(const char *path, size_t n) {
@@ -56,19 +57,19 @@ void checker(const std::vector<float> &O, const std::vector<float> &O_ref, size_
 
 int main() {
     // matrix dims
-    const int N = 4096, b = 1, h = 4, d_k = 64, d_v = 64;
-    // const int N = 517, b = 2, h = 3, d_k = 64, d_v = 48;
+    // const int N = 4096, b = 1, h = 4, d_k = 64, d_v = 64;
+    const int N = 517, b = 2, h = 3, d_k = 64, d_v = 48;
 
     const size_t qk_elems = (size_t)b * N * h * d_k;
     const size_t vo_elems = (size_t)b * N * h * d_v;
 
-    const bool causal_masking = true;
+    const bool causal_masking = false;
 
     // load reference matrices
-    auto hQ   = load_fp16("../matrices/batch_massive_causal/Q.f32", qk_elems);
-    auto hK   = load_fp16("../matrices/batch_massive_causal/K.f32", qk_elems);
-    auto hV   = load_fp16("../matrices/batch_massive_causal/V.f32", vo_elems);
-    auto hRef = load("../matrices/batch_massive_causal/O.f32", vo_elems);
+    auto hQ   = load_fp16("../matrices/fp16_batch_odd/Q.f32", qk_elems);
+    auto hK   = load_fp16("../matrices/fp16_batch_odd/K.f32", qk_elems);
+    auto hV   = load_fp16("../matrices/fp16_batch_odd/V.f32", vo_elems);
+    auto hRef = load("../matrices/fp16_batch_odd/O.f32", vo_elems);
 
     // allocate device mem
     // fp16
@@ -111,13 +112,13 @@ int main() {
     // tuner<h, 128, 32, d_k, d_v, causal_masking>(dQ, dK, dV, dO, hRef, b, N);
 
     const int b_r = 128;
-    const int b_c = 64;
+    const int b_c = 32;
 
     // x = query blocks, y = heads, z = batches
     dim3 grid(CEIL_DIV(N, b_r), h, b);
 
     // launch kernel with template dims
-    flash_attention<h, b_r, b_c, d_k, d_v, causal_masking><<<grid, 2 * b_r>>>(dQ, dK, dV, dO, N);
+    flash_attention_wmma<h, b_r, b_c, d_k, d_v, causal_masking><<<grid, 2 * b_r>>>(dQ, dK, dV, dO, N);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) { printf("launch failed: %s\n", cudaGetErrorString(err)); return 1; }
