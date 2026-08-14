@@ -8,8 +8,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-#include "flash-attention.cuh"
-#include "flash-attention-wmma.cuh"
+#include "flash_attention.cuh"
+#include "flash_attention_wmma.cuh"
 
 // tile size autotuner
 // defaults to float unless half passed in
@@ -30,7 +30,7 @@ void tuner(T *dQ, T *dK, T *dV, float *dO, const std::vector<float> &hRef, int B
     cudaEventCreate(&stop);
 
     // warmup
-    flash_attention_wmma<H, B_r, B_c, D_K, D_V, causal><<<grid, B_r * 2>>>(dQ, dK, dV, dO, N);
+    flash_attention<H, B_r, B_c, D_K, D_V, causal><<<grid, B_r * 2>>>(dQ, dK, dV, dO, N);
 
     // a launch that fails (smem over limit, bad config) is silent
     cudaError_t launch = cudaGetLastError();
@@ -45,7 +45,7 @@ void tuner(T *dQ, T *dK, T *dV, float *dO, const std::vector<float> &hRef, int B
     std::vector<float> times;
     for (int r = 0; r < reps; ++r) {
         cudaEventRecord(start);
-        flash_attention_wmma<H, B_r, B_c, D_K, D_V, causal><<<grid, 2 * B_r>>>(dQ, dK, dV, dO, N);
+        flash_attention<H, B_r, B_c, D_K, D_V, causal><<<grid, 2 * B_r>>>(dQ, dK, dV, dO, N);
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
         float ms;

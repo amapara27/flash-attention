@@ -1,51 +1,28 @@
 #pragma once
 
-#include <cassert>
-
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <math_constants.h>
 #include <cuda_fp16.h>
 #include <cuda_pipeline.h>
-#include <mma.h>
 
 #define CEIL_DIV(A, B) (((A) + (B) - 1) / (B))
-
-using namespace nvcuda;
 
 // flash attention kernel for a single tile, but laid some ground work for multiple tiles and blocks
 // B_r - query rows a single block owns, B_c keys per tile
 template <int H, int B_r, int B_c, int D_K, int D_V, bool causal, typename T = float>
-__global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
+__global__ void flash_attention(T *Q, T *K, T *V, float *O, int N) {
     // matrix dims: [Batches (B), Sequence Length (N), Attention Head (H), Dimensionality (D)]                                                                                                                                                                                                                          
 
     // one thread per row (unnecessary for one block, but keeping for increased size)
     // int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // wmma indexing vals
-    int warp_id = threadIdx.x / 32;
-    int warp_row_base = warp_id * 16; // B_r = 128, 8 warps per block, each warp does 16 rows of B_r
-
-    // old vals used to index row by thread - wmma uses warps to index
     // warp partitioning: two threads per row
-    int lane = threadIdx.x % 32;
-    int local_row = lane / 2; 
-    int row_half = lane % 2; // which half the lane starts at
+    int row_idx = threadIdx.x / 2; 
+    int row_half = threadIdx.x % 2;
 
-    // cols the lane starts at
-    int col_start = row_half * (B_c / 2); // which col the lane starts at for S
-    int v_start = row_half * (D_V / 2);
-
-    int row_idx = warp_row_base + local_row; // row of the warp + the local row of the lane
-    int q_idx = blockIdx.x * B_r + row_idx; // global row idx of Q
-
-    
-    // ensures that no extra threads are active if N / B_r isn't a whole number
-    // allows for variety of dimensions
-    bool active = q_idx < N;
-
-    // ensure dims are correct 
-    assert (blockDim.x / 32 == B_r / 16);
+    // query row idx is the row idx within the block
+    int q_idx = blockIdx.x * B_r + row_idx;
 
     // highest query row idx within block
     int highest_qidx = blockIdx.x * B_r + B_r - 1;
@@ -73,12 +50,11 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
     const int tn_s = B_c;
     const int tn_o = D_V / 2; // each thread computes the final dp of D_V / 2 elements in O_acc
 
-    // matmul accumulator for O (S is now in smem)
-    float O_acc[tm * tn_o] = {0.0f}; // each thread 
-
-    // each warp does B_r / thread per warp rows
+    // matmul accumulator registers - per thread
+    float S[tm * tn_s]; // warp partitioning makes each element a partial sum - needs shuffling
+    float O_acc[tm * tn_o] = {0.0f}; // each thrad 
     float m = -CUDART_INF_F;
-    float ell = 0.0f;
+    float ell = 0;
 
     // scale val for attention
     // putting into log2 space to enable exp2f - better perf on GPUs
@@ -92,15 +68,9 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
     __align__(16) __shared__ __half Ks[2][B_c * D_K];
     __align__(16) __shared__ __half Vs[2][B_c * D_V];
 
-    __shared__ float S_smem[B_r * B_c];
-
-    // wmma allocation for q and k - loading 16 x 16 tiles
-    // takes in fp16 - outputs fp16
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> q_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> k_frag; // column major - read transposed
-
-    const int s_tiles = B_c / 16;
-    wmma::fragment<wmma::accumulator, 16,16,16, float> s_frag[s_tiles]; // 2 since B_c = 32 (32 / 16 rows = 2)
+    // ensures that no extra threads are active if N / B_r isn't a whole number
+    // allows for variety of dimensions
+    bool active = q_idx < N;
 
     // load Q into sram - each thread loads in a column
     // loads are now indexed by block-local threads
@@ -177,10 +147,6 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
     int T_c = CEIL_DIV(N, B_c); 
 
     for (int iter = 0; iter < T_c; ++iter) {
-        // 0 the accumulators - new 16 x 32 calculation each time
-        wmma::fill_fragment(s_frag[0], 0.0f);
-        wmma::fill_fragment(s_frag[1], 0.0f);
-
         // load K and V into sram - per thread
         // coalesced - each consecutive thread accesses adjacent elements per iter
         // double buffering - must ensure next batch is within tile amount
@@ -253,49 +219,43 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
 
 
             // First matmul: S matrix calculation - Q @ K.T
-            // MMA version - Tensor Cores
-            // 16 tile fragments, so iterate k by 16
-            for (int k = 0; k < D_K; k += 16) {
-                // loads Q from smem, 3rd argument D_K (leading dimension - stride between rows)
-                wmma::load_matrix_sync(q_frag, &Qs[warp_row_base * D_K + k], D_K);
-
-                // matmul - iterates twice to access s_tiles = B_c / 16 rows per warp tile (2 with B_C = 32)
-                // double buffering: iter % 2
+            // warp partitioning: start at the first col of the half the thread is working on, iterate for D_K / 2 (half)
+            #pragma unroll
+            for (int col = 0; col < B_c; ++col) {
+                float acc = 0.0f;
+                int k_idx = iter * B_c + col; // key idx is the global key index = tile offset + local col
+                
                 #pragma unroll
-                for (int i = 0; i < s_tiles; ++i) {
-                    wmma::load_matrix_sync(k_frag, &Ks[iter % 2][i * 16 * D_K + k], D_K);
-                    wmma::mma_sync(s_frag[i], q_frag, k_frag, s_frag[i]);
+                for (int k = row_half * (D_K / 2); k < row_half * (D_K / 2) + (D_K / 2); ++k) {
+                    // Qs indexed by local tile - mutliple blocks
+                    // recast fp16 vals to fp32 to minimize round errors
+                    // double buffering: needs iter % 2 index
+                    acc += __half2float(Qs[row_idx * D_K + k]) * __half2float(Ks[iter % 2][col * D_K + k]);
                 }
-            }
 
-            // store S fragments in smem
-            # pragma unroll
-            for (int i = 0; i < s_tiles; ++i) {
-                // warp_row_base * B_C = 32 row chunk, i * 16 gets the 16 row segment within the 32 chunk
-                wmma::store_matrix_sync(&S_smem[warp_row_base * B_c + i * 16], s_frag[i], B_c, wmma::mem_row_major);
-            }
+                S[col] = acc * scale;
 
-            // masking
-            for (int col = col_start; col < col_start + (B_c / 2); ++col) {
-                int k_idx = iter * B_c + col;
-
+                // masking: key col > query row - sets element to negative infinity
+                // handles various dim sizes for N - some tiles may only have x < B_c real columns, so only put values in those
                 if (k_idx >= N || (causal && k_idx > q_idx)) {
-                    S_smem[row_idx * B_c + col] = -CUDART_INF_F;
-                } else {
-                    S_smem[row_idx * B_c + col] *= scale;
+                    S[col] = -CUDART_INF_F;
                 }
             }
 
-            __syncwarp();
+            // shuffle
+            // each entry needs its own shuffle: two partials across two lanes, B_c entries, B_c shuffles
+            #pragma unroll
+            for (int col = 0; col < B_c; ++col) {
+                S[col] += __shfl_xor_sync(__activemask(), S[col], 1);
+            }
             
             float m_j = -CUDART_INF_F;
 
             // find rowmax of tile
             // can now use B_c since padding is implemented - extra cols won't have an impact
-            // S is now in SMEM
             #pragma unroll
             for (int i = 0; i < B_c; ++i) {
-                m_j = fmaxf(m_j, S_smem[row_idx * B_c + i]);
+                m_j = fmaxf(m_j, S[i]);
             }
 
             // corrections
@@ -320,7 +280,7 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
                 // warp partitioning: each thread does half of its row
                 #pragma unroll
                 for (int col = 0; col < B_c; ++col) {
-                    float P = exp2f(S_smem[row_idx * B_c + col] - m_new);
+                    float P = exp2f(S[col] - m_new);
 
                     // rowsum of exponentials
                     ell += P;
@@ -328,7 +288,7 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
                     for (int v = 0; v < D_V / 2; ++v) {
                         // col * D_V gets row, row_half * D_V / 2 gets starting half, v gets correct col within that half
                         // double buffering: needs iter % 2 index
-                        O_acc[v] += P * __half2float(Vs[iter % 2][col * D_V + v_start + v]);
+                        O_acc[v] += P * __half2float(Vs[iter % 2][col * D_V + row_half * (D_V / 2) + v]);
                     }
                 }
             }
@@ -336,7 +296,6 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
             // correct max
             m = m_new;
         }
-
         __syncthreads();
     }
      
@@ -345,7 +304,7 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
         for (int i = 0; i < D_V / 2; ++i) {
             O_acc[i] = O_acc[i] / ell;
             // q_idx * stride_n_vo gets row, row_half * D_V / 2 gets starting half, i gets correct col within that half
-            O[q_idx * stride_n_vo + v_start + i] = O_acc[i];
+            O[q_idx * stride_n_vo + row_half * (D_V / 2) + i] = O_acc[i];
         }
     }
 }
