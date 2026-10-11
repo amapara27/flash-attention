@@ -10,3 +10,6 @@ matrices
 *.csv
 
 .vscode
+
+BENCHMARK_PLAN.md
+benchmarks/
