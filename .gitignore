@@ -12,4 +12,11 @@ matrices
 .vscode
 
 BENCHMARK_PLAN.md
-benchmarks/
+findings.md
+
+# benchmarks: track the harness, docs and result CSVs; everything else is generated
+benchmarks/bin/
+benchmarks/fixtures/
+benchmarks/results/raw/
+benchmarks/stages/*/kernel.cuh
+!benchmarks/results/*.csv
