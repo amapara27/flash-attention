@@ -175,9 +175,11 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
     int T_c = CEIL_DIV(N, B_c); 
 
     for (int iter = 0; iter < T_c; ++iter) {
-        // 0 the accumulators - new 16 x 32 calculation each time
-        wmma::fill_fragment(s_frag[0], 0.0f);
-        wmma::fill_fragment(s_frag[1], 0.0f);
+        // 0 the accumulators - new 16 x B_c calculation each time (B_c / 16 fragments)
+        #pragma unroll
+        for (int i = 0; i < s_tiles; ++i) {
+            wmma::fill_fragment(s_frag[i], 0.0f);
+        }
 
         // load K and V into sram - per thread
         // coalesced - each consecutive thread accesses adjacent elements per iter
@@ -272,6 +274,8 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
             wmma::store_matrix_sync(&S_smem[warp_row_base * B_c + i * 16], s_frag[i], B_c, wmma::mem_row_major);
         }
 
+        __syncwarp();
+
         // masking
         for (int col = col_start; col < col_start + (B_c / 2); ++col) {
             int k_idx = iter * B_c + col;
@@ -332,6 +336,8 @@ __global__ void flash_attention_wmma(T *Q, T *K, T *V, float *O, int N) {
 
         // correct max
         m = m_new;
+
+        __syncthreads();
     }
 
     __syncthreads();

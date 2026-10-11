@@ -10,7 +10,7 @@
 
 // flash attention kernel for a single tile, but laid some ground work for multiple tiles and blocks
 // B_r - query rows a single block owns, B_c keys per tile
-template <int H, int B_r, int B_c, int D_K, int D_V, bool causal, typename T = float>
+template <int H, int B_r, int B_c, int D_K, int D_V, bool causal, typename T = __half>
 __global__ void flash_attention(T *Q, T *K, T *V, float *O, int N) {
     // matrix dims: [Batches (B), Sequence Length (N), Attention Head (H), Dimensionality (D)]                                                                                                                                                                                                                          
 
